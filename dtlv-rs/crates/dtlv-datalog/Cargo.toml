@@ -1,0 +1,14 @@
+[package]
+name = "dtlv-datalog"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dtlv-codec = { path = "../dtlv-codec" }
+dtlv-kv = { path = "../dtlv-kv" }
+dtlv-search = { path = "../dtlv-search" }
+heed.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

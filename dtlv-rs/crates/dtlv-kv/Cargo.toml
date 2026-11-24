@@ -1,0 +1,12 @@
+[package]
+name = "dtlv-kv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dtlv-codec = { path = "../dtlv-codec" }
+heed.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

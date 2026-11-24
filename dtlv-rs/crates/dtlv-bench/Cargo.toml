@@ -1,0 +1,11 @@
+[package]
+name = "dtlv-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dtlv-codec = { path = "../dtlv-codec" }
+dtlv-kv = { path = "../dtlv-kv" }
+dtlv-datalog = { path = "../dtlv-datalog" }
+dtlv-search = { path = "../dtlv-search" }
+tempfile.workspace = true
