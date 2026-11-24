@@ -1,0 +1,14 @@
+{:paths ["src" "test"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.7"}
+        datalevin/datalevin {:mvn/version "1.2.10"}
+        org.replikativ/datahike {:mvn/version "0.8.1920"}
+        com.xtdb/xtdb-api {:mvn/version "2.1.0"}
+        com.xtdb/xtdb-core {:mvn/version "2.1.0"}
+        com.datomic/local {:mvn/version "1.0.301"}
+        datascript/datascript {:mvn/version "1.8.1"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :jvm-opts ["-Xms1g" "-Xmx2g"
+                    "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                    "--enable-native-access=ALL-UNNAMED"]}}}
