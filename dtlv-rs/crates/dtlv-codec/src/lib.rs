@@ -252,11 +252,17 @@ pub fn encode_ea_prefix(e: EntityId, a: AttrId, out: &mut Vec<u8>) {
 
 /// AVE prefix: [a: 4B][escaped(encoded_value)]
 pub fn encode_av_prefix(a: AttrId, val: &Value, out: &mut Vec<u8>) {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    }
     out.clear();
     out.extend_from_slice(&a.to_be_bytes());
-    let mut tmp = Vec::with_capacity(32);
-    encode_value(val, &mut tmp);
-    encode_escaped_bytes(&tmp, out);
+    SCRATCH.with(|cell| {
+        let mut tmp = cell.borrow_mut();
+        tmp.clear();
+        encode_value(val, &mut tmp);
+        encode_escaped_bytes(&tmp, out);
+    });
 }
 
 /// AVE full key: [a: 4B][escaped(encoded_value)][e: 8B]

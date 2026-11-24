@@ -100,24 +100,17 @@ fn bench<F: FnMut(&str)>(tickers: &[String], mut f: F) -> (f64, f64, f64) {
     )
 }
 
-fn main() {
-    let dir = tempdir().unwrap();
-    let conn = Conn::open(dir.path(), make_schema()).unwrap();
-    let securities = make_securities(NUM_SECURITIES);
-    let tickers: Vec<String> = (0..200)
-        .map(|i| if i == 0 { "AAPL".into() } else { format!("T{:05}", i) })
-        .collect();
-
+fn run_suite(label: &str, conn: &Conn, securities: &[TxItem], tickers: &[String]) {
     // 1. SOD batch ingestion
     let t0 = Instant::now();
-    let eids = conn.transact(&securities).unwrap();
+    let eids = conn.transact(securities).unwrap();
     let ingest_ms = t0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(eids.len(), NUM_SECURITIES);
 
     let rtxn = conn.read_txn().unwrap();
 
     // 2a. Zero-copy direct index read (lookup_entity_by_av + get_attr)
-    let (direct_p50, direct_p95, direct_p99) = bench(&tickers, |t| {
+    let (direct_p50, direct_p95, direct_p99) = bench(tickers, |t| {
         let eid = conn
             .lookup_entity_by_av(&rtxn, ":sec/ticker", &Value::Str(t.to_string()))
             .unwrap()
@@ -128,7 +121,7 @@ fn main() {
     });
 
     // 2b. Datalog join query (conn.q)
-    let (q_p50, q_p95, q_p99) = bench(&tickers, |t| {
+    let (q_p50, q_p95, q_p99) = bench(tickers, |t| {
         let q = Query {
             find: vec!["?isin".into(), "?lot".into(), "?sf".into()],
             patterns: vec![
@@ -216,7 +209,7 @@ fn main() {
             Pred::Gt("?tt".into(), "?tat".into()),
         ],
     };
-    let _ = bitemp_q; // Verified via direct attr filter in unit tests; run query check:
+    let _ = bitemp_q;
     let all_vers = conn
         .q(
             &rtxn2,
@@ -240,7 +233,7 @@ fn main() {
         dtlv_datalog::PullSelector::Attr(":sec/lot-size".into()),
         dtlv_datalog::PullSelector::Attr(":sec/split-factor".into()),
     ]);
-    let (pp_p50, pp_p95, pp_p99) = bench(&tickers, |t| {
+    let (pp_p50, pp_p95, pp_p99) = bench(tickers, |t| {
         let m = pp
             .execute_by_lookup(&rtxn2, ":sec/ticker", &Value::Str(t.to_string()))
             .unwrap()
@@ -254,12 +247,12 @@ fn main() {
             "[]",
         )
         .unwrap();
-    let (pq_p50, pq_p95, pq_p99) = bench(&tickers, |t| {
+    let (pq_p50, pq_p95, pq_p99) = bench(tickers, |t| {
         let res = pq.execute(&rtxn2, &[Value::Str(t.to_string())]).unwrap();
         assert!(matches!(res, dtlv_datalog::QueryResult::Tuple(Some(_))));
     });
 
-    println!("\n================ DTLV-RS (RUST) BENCHMARK RESULTS ================");
+    println!("\n================ {} BENCHMARK RESULTS ================", label);
     println!(
         "SOD Batch Load (2,000 securities): {:.1} ms ({:.0} rec/sec)",
         ingest_ms,
@@ -281,5 +274,33 @@ fn main() {
         "Datalog Join Query (p50 / p95 / p99): {:.2} us / {:.2} us / {:.2} us",
         q_p50, q_p95, q_p99
     );
-    println!("==================================================================\n");
+    println!("==================================================================");
+}
+
+fn main() {
+    let dir = tempdir().unwrap();
+    let securities = make_securities(NUM_SECURITIES);
+    let tickers: Vec<String> = (0..200)
+        .map(|i| if i == 0 { "AAPL".into() } else { format!("T{:05}", i) })
+        .collect();
+
+    let lmdb_conn = Conn::open(dir.path().join("lmdb"), make_schema()).unwrap();
+    run_suite("dtlv-rs (LMDB)", &lmdb_conn, &securities, &tickers);
+
+    let snap_t0 = Instant::now();
+    let rtxn = lmdb_conn.read_txn().unwrap();
+    lmdb_conn
+        .save_to_sqlite(&rtxn, dir.path().join("snapshot.sqlite"))
+        .unwrap();
+    let snap_ms = snap_t0.elapsed().as_secs_f64() * 1000.0;
+    println!("LMDB -> SQLite Snapshot Export (2,000 securities): {:.1} ms", snap_ms);
+
+    let sqlite_conn = Conn::open_sqlite(dir.path().join("direct.sqlite"), make_schema()).unwrap();
+    run_suite("dtlv-rs (SQLite)", &sqlite_conn, &securities, &tickers);
+
+    let redb_conn = Conn::open_redb(dir.path().join("direct.redb"), make_schema()).unwrap();
+    run_suite("dtlv-rs (redb)", &redb_conn, &securities, &tickers);
+
+    let mem_conn = Conn::open_mem(make_schema()).unwrap();
+    run_suite("dtlv-rs (Mem BTreeMap)", &mem_conn, &securities, &tickers);
 }

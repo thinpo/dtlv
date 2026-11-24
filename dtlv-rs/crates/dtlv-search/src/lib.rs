@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use dtlv_codec::EntityId;
-use dtlv_kv::{KvError, KvStore, RawDb};
-use heed::{RoTxn, RwTxn};
+use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
 
 pub struct FullTextIndex {
     postings: RawDb,
@@ -20,16 +19,16 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn read_u64(db: &RawDb, rtxn: &RoTxn, key: &[u8]) -> Result<u64, KvError> {
+fn read_u64(db: &RawDb, rtxn: &ReadTxn<'_>, key: &[u8]) -> Result<u64, KvError> {
     Ok(match db.get(rtxn, key)? {
-        Some(b) if b.len() == 8 => u64::from_be_bytes(b.try_into().unwrap()),
+        Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
         _ => 0,
     })
 }
 
-fn read_u64_rw(db: &RawDb, wtxn: &RwTxn, key: &[u8]) -> Result<u64, KvError> {
-    Ok(match db.get(wtxn, key)? {
-        Some(b) if b.len() == 8 => u64::from_be_bytes(b.try_into().unwrap()),
+fn read_u64_rw(db: &RawDb, wtxn: &WriteTxn<'_>, key: &[u8]) -> Result<u64, KvError> {
+    Ok(match db.get_rw(wtxn, key)? {
+        Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
         _ => 0,
     })
 }
@@ -59,7 +58,7 @@ fn encode_terms_blob(terms: &[String]) -> Vec<u8> {
 }
 
 impl FullTextIndex {
-    pub fn open(store: &KvStore, wtxn: &mut RwTxn) -> Result<Self, KvError> {
+    pub fn open(store: &KvStore, wtxn: &mut WriteTxn<'_>) -> Result<Self, KvError> {
         let postings = store.open_db(wtxn, "fts_postings")?;
         let doc_lens = store.open_db(wtxn, "fts_doc_lens")?;
         let doc_terms = store.open_db(wtxn, "fts_doc_terms")?;
@@ -73,10 +72,10 @@ impl FullTextIndex {
     }
 
     /// Remove an entity's previous full-text postings and adjust global stats.
-    pub fn remove_doc(&self, wtxn: &mut RwTxn, eid: EntityId) -> Result<(), KvError> {
+    pub fn remove_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
         let eid_key = eid.to_be_bytes();
         let old_len = read_u64_rw(&self.doc_lens, wtxn, &eid_key)?;
-        if let Some(blob) = self.doc_terms.get(wtxn, &eid_key)? {
+        if let Some(blob) = self.doc_terms.get_rw(wtxn, &eid_key)? {
             let terms_bytes = blob.to_vec();
             let mut key = Vec::with_capacity(64);
             for term_slice in terms_bytes.split(|&b| b == 0x00) {
@@ -104,7 +103,7 @@ impl FullTextIndex {
         Ok(())
     }
 
-    pub fn index_doc(&self, wtxn: &mut RwTxn, eid: EntityId, text: &str) -> Result<(), KvError> {
+    pub fn index_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, text: &str) -> Result<(), KvError> {
         // Ensure idempotent replacement if entity already had indexed text
         self.remove_doc(wtxn, eid)?;
 
@@ -139,7 +138,7 @@ impl FullTextIndex {
     /// BM25 full-text search returning (EntityId, score) sorted descending.
     pub fn search(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, f64)>, KvError> {
@@ -165,7 +164,7 @@ impl FullTextIndex {
                 let (k, v) = item?;
                 if k.len() >= 9 && v.len() == 4 {
                     let eid = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
-                    let tf = u32::from_be_bytes(v.try_into().unwrap());
+                    let tf = u32::from_be_bytes(v.as_ref().try_into().unwrap());
                     hits.push((eid, tf));
                 }
             }
@@ -203,12 +202,12 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    pub fn open(store: &KvStore, wtxn: &mut RwTxn, name: &str, metric: Metric) -> Result<Self, KvError> {
+    pub fn open(store: &KvStore, wtxn: &mut WriteTxn<'_>, name: &str, metric: Metric) -> Result<Self, KvError> {
         let vectors = store.open_db(wtxn, name)?;
         Ok(Self { vectors, metric })
     }
 
-    pub fn add_vec(&self, wtxn: &mut RwTxn, eid: EntityId, vec: &[f32]) -> Result<(), KvError> {
+    pub fn add_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, vec: &[f32]) -> Result<(), KvError> {
         let mut bytes = Vec::with_capacity(vec.len() * 4);
         for &f in vec {
             bytes.extend_from_slice(&f.to_le_bytes());
@@ -217,36 +216,86 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn remove_vec(&self, wtxn: &mut RwTxn, eid: EntityId) -> Result<(), KvError> {
+    pub fn remove_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
         self.vectors.delete(wtxn, &eid.to_be_bytes())?;
         Ok(())
     }
 
-    /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer).
+    pub fn dump_vecs(&self, rtxn: &ReadTxn<'_>) -> Result<Vec<(EntityId, Vec<f32>)>, KvError> {
+        let mut out = Vec::new();
+        for item in self.vectors.iter(rtxn)? {
+            let (key, val) = item?;
+            if key.len() != 8 || val.len() % 4 != 0 {
+                continue;
+            }
+            let eid = u64::from_be_bytes(key.as_ref().try_into().unwrap());
+            let vec: Vec<f32> = val
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            out.push((eid, vec));
+        }
+        Ok(out)
+    }
+
+    /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer) using bounded O(k) memory.
     pub fn search_vec(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(EntityId, f32)>, KvError> {
-        let mut scored = Vec::new();
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        #[derive(Clone, Copy)]
+        struct Hit(f32, EntityId);
+        impl PartialEq for Hit {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0 && self.1 == other.1
+            }
+        }
+        impl Eq for Hit {}
+        impl PartialOrd for Hit {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Hit {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Max-heap by distance so we can evict the worst candidate in O(log k)
+                self.0
+                    .partial_cmp(&other.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| self.1.cmp(&other.1))
+            }
+        }
+
+        let mut heap: std::collections::BinaryHeap<Hit> = std::collections::BinaryHeap::with_capacity(k + 1);
         let mut candidate = Vec::with_capacity(query.len());
         for item in self.vectors.iter(rtxn)? {
             let (key, val) = item?;
             if key.len() != 8 || val.len() != query.len() * 4 {
                 continue;
             }
-            let eid = u64::from_be_bytes(key.try_into().unwrap());
+            let eid = u64::from_be_bytes(key.as_ref().try_into().unwrap());
             candidate.clear();
             for chunk in val.chunks_exact(4) {
                 candidate.push(f32::from_le_bytes(chunk.try_into().unwrap()));
             }
             let dist = compute_distance(self.metric, query, &candidate);
-            scored.push((eid, dist));
+            if heap.len() < k {
+                heap.push(Hit(dist, eid));
+            } else if let Some(worst) = heap.peek() {
+                if dist < worst.0 {
+                    heap.pop();
+                    heap.push(Hit(dist, eid));
+                }
+            }
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        Ok(scored)
+        let mut out: Vec<(EntityId, f32)> = heap.into_iter().map(|h| (h.1, h.0)).collect();
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
     }
 }
 

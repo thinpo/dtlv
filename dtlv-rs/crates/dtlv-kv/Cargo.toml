@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 dtlv-codec = { path = "../dtlv-codec" }
 heed.workspace = true
+rusqlite.workspace = true
+redb.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

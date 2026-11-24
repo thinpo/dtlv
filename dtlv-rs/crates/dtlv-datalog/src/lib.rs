@@ -6,9 +6,8 @@ use dtlv_codec::{
     decode_ave_entity, decode_value, encode_av_prefix, encode_ave_key, encode_ea_prefix,
     encode_eav_key, encode_vae_key, AttrId, CodecError, EntityId, Value,
 };
-use dtlv_kv::{KvError, KvStore, RawDb};
+use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
 use dtlv_search::{FullTextIndex, Metric, VectorIndex};
-use heed::{RoTxn, RwTxn};
 use parser::{
     parse_query, parse_query_template, parse_rules, AggOp, Clause, CmpOp, ExprTerm, FindElem,
     FindSpec, OrderKey, ParseError, ParsedQuery, RuleDef,
@@ -86,8 +85,6 @@ impl AttrSpec {
 pub enum DatalogError {
     #[error("kv error: {0}")]
     Kv(#[from] KvError),
-    #[error("lmdb error: {0}")]
-    Heed(#[from] heed::Error),
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
     #[error("unknown attribute: {0}")]
@@ -208,8 +205,30 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// Open or create an LMDB-backed Datalog connection at `path`.
     pub fn open<P: AsRef<Path>>(path: P, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
         let store = KvStore::open(path, 512 * 1024 * 1024, 16)?;
+        Self::init_from_store(store, schema)
+    }
+
+    /// Open or create a single-file SQLite-backed Datalog connection at `path` (WAL mode).
+    pub fn open_sqlite<P: AsRef<Path>>(path: P, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
+        let store = KvStore::open_sqlite(path)?;
+        Self::init_from_store(store, schema)
+    }
+
+    /// Open or create a pure-Rust single-file `redb`-backed Datalog connection at `path`.
+    pub fn open_redb<P: AsRef<Path>>(path: P, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
+        let store = KvStore::open_redb(path)?;
+        Self::init_from_store(store, schema)
+    }
+
+    /// Create an ephemeral pure-Rust in-memory (`BTreeMap`) Datalog connection.
+    pub fn open_mem(schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
+        Self::init_from_store(KvStore::open_mem(), schema)
+    }
+
+    fn init_from_store(store: KvStore, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
         let mut wtxn = store.write_txn()?;
         let eav = store.open_db(&mut wtxn, "eav")?;
         let ave = store.open_db(&mut wtxn, "ave")?;
@@ -218,11 +237,11 @@ impl Conn {
         let fts = FullTextIndex::open(&store, &mut wtxn)?;
         let vec_idx = VectorIndex::open(&store, &mut wtxn, "vec_idx", Metric::Cosine)?;
 
-        if meta.get(&wtxn, NEXT_EID_KEY)?.is_none() {
+        if meta.get_rw(&wtxn, NEXT_EID_KEY)?.is_none() {
             meta.put(&mut wtxn, NEXT_EID_KEY, &1u64.to_be_bytes())?;
         }
-        let mut next_aid: AttrId = match meta.get(&wtxn, NEXT_AID_KEY)? {
-            Some(b) if b.len() == 4 => u32::from_be_bytes(b.try_into().unwrap()),
+        let mut next_aid: AttrId = match meta.get_rw(&wtxn, NEXT_AID_KEY)? {
+            Some(b) if b.len() == 4 => u32::from_be_bytes(b.as_ref().try_into().unwrap()),
             _ => 1,
         };
 
@@ -231,13 +250,13 @@ impl Conn {
         let mut attrs = HashMap::new();
 
         // Load existing attr_name -> aid mappings from meta ("attr:<name>")
-        for item in meta.prefix_iter(&wtxn, b"attr:")? {
+        for item in meta.prefix_iter_rw(&wtxn, b"attr:")? {
             let (k, v) = item?;
             if v.len() == 4 {
                 let name = std::str::from_utf8(&k[5..])
                     .map_err(|_| CodecError::InvalidUtf8)?
                     .to_owned();
-                let aid = u32::from_be_bytes(v.try_into().unwrap());
+                let aid = u32::from_be_bytes(v.as_ref().try_into().unwrap());
                 attr_ids.insert(name.clone(), aid);
                 aid_names.insert(aid, name);
             }
@@ -276,8 +295,83 @@ impl Conn {
         })
     }
 
+    /// Persist a consistent snapshot of `meta`, `eav`, `ave`, `vae`, and `vec_idx`
+    /// from this connection into a portable SQLite file at `sqlite_path`.
+    pub fn save_to_sqlite<P: AsRef<Path>>(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        sqlite_path: P,
+    ) -> Result<(), DatalogError> {
+        let dst = KvStore::open_sqlite(sqlite_path)?;
+        let mut wtxn = dst.write_txn()?;
+        for (dbi_name, s_db) in [
+            ("meta", &self.meta),
+            ("eav", &self.eav),
+            ("ave", &self.ave),
+            ("vae", &self.vae),
+        ] {
+            let dst_db = dst.open_db(&mut wtxn, dbi_name)?;
+            for item in s_db.iter(rtxn)? {
+                let (k, v) = item?;
+                dst_db.put(&mut wtxn, k.as_ref(), v.as_ref())?;
+            }
+        }
+        let dst_vec = dst.open_db(&mut wtxn, "vec_idx")?;
+        for (eid, vec) in self.vec_idx.dump_vecs(rtxn)? {
+            let mut bytes = Vec::with_capacity(vec.len() * 4);
+            for f in vec {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            dst_vec.put(&mut wtxn, &eid.to_be_bytes(), &bytes)?;
+        }
+        wtxn.commit()?;
+        dst.sync()?;
+        Ok(())
+    }
+
+    /// Restore an LMDB-backed `Conn` at `lmdb_dir` from a SQLite snapshot at `sqlite_path`.
+    pub fn load_from_sqlite<P: AsRef<Path>, Q: AsRef<Path>>(
+        lmdb_dir: P,
+        sqlite_path: Q,
+        schema: Vec<AttrSpec>,
+    ) -> Result<Self, DatalogError> {
+        let src = Self::open_sqlite(sqlite_path, schema.clone())?;
+        let srtxn = src.read_txn()?;
+        let dst = Self::open(lmdb_dir, schema)?;
+        let mut wtxn = dst.store.write_txn()?;
+        for (src_db, dst_db) in [
+            (&src.meta, &dst.meta),
+            (&src.eav, &dst.eav),
+            (&src.ave, &dst.ave),
+            (&src.vae, &dst.vae),
+        ] {
+            for item in src_db.iter(&srtxn)? {
+                let (k, v) = item?;
+                dst_db.put(&mut wtxn, k.as_ref(), v.as_ref())?;
+            }
+        }
+        wtxn.commit()?;
+        for (eid, vec) in src.vec_idx.dump_vecs(&srtxn)? {
+            dst.add_vec(eid, &vec)?;
+        }
+        // Rebuild FTS index from EAV for all fulltext attributes
+        let datoms = dst.datoms(&dst.read_txn()?, IndexKind::Eavt)?;
+        let mut fwtxn = dst.store.write_txn()?;
+        for (eid, attr_name, val) in datoms {
+            if let Ok(aid) = dst.attr_id(&attr_name) {
+                if dst.attrs[&aid].fulltext {
+                    if let Some(txt) = val.as_str() {
+                        dst.fts.index_doc(&mut fwtxn, eid, txt)?;
+                    }
+                }
+            }
+        }
+        fwtxn.commit()?;
+        Ok(dst)
+    }
+
     #[inline]
-    pub fn read_txn(&self) -> Result<RoTxn<'_>, DatalogError> {
+    pub fn read_txn(&self) -> Result<ReadTxn<'_>, DatalogError> {
         Ok(self.store.read_txn()?)
     }
 
@@ -293,25 +387,30 @@ impl Conn {
     #[inline]
     pub fn lookup_entity_by_av(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         val: &Value,
     ) -> Result<Option<EntityId>, DatalogError> {
-        let aid = self.attr_id(attr)?;
-        let mut pref = Vec::with_capacity(32);
-        encode_av_prefix(aid, val, &mut pref);
-        if let Some(res) = self.ave.prefix_iter(rtxn, &pref)?.next() {
-            let (k, _) = res?;
-            return Ok(Some(decode_ave_entity(k)?));
+        thread_local! {
+            static PREF_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
         }
-        Ok(None)
+        let aid = self.attr_id(attr)?;
+        PREF_BUF.with(|cell| {
+            let mut pref = cell.borrow_mut();
+            encode_av_prefix(aid, val, &mut pref);
+            if let Some(res) = self.ave.prefix_iter(rtxn, &pref)?.next() {
+                let (k, _) = res?;
+                return Ok(Some(decode_ave_entity(&k)?));
+            }
+            Ok(None)
+        })
     }
 
     /// Direct EAV attribute read for a known EntityId.
     #[inline]
     pub fn get_attr(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         eid: EntityId,
         attr: &str,
     ) -> Result<Option<Value>, DatalogError> {
@@ -330,7 +429,7 @@ impl Conn {
     #[inline]
     pub fn entid(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         val: &Value,
     ) -> Result<Option<EntityId>, DatalogError> {
@@ -344,7 +443,7 @@ impl Conn {
     /// Return all datoms `(eid, attr_name, value)` from the specified index.
     pub fn datoms(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         index: IndexKind,
     ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
         let mut out = Vec::new();
@@ -370,7 +469,7 @@ impl Conn {
                         continue;
                     }
                     let aid = u32::from_be_bytes(k[0..4].try_into().unwrap());
-                    let eid = decode_ave_entity(k)?;
+                    let eid = decode_ave_entity(&k)?;
                     let (raw_val, _) = dtlv_codec::decode_escaped_bytes(&k[4..k.len() - 8])?;
                     let val = decode_value(&raw_val)?;
                     if let Some(name) = self.aid_names.get(&aid) {
@@ -399,7 +498,7 @@ impl Conn {
     /// Bounded AVE range scan `[start..=end]` for an indexed attribute.
     pub fn index_range(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         start: &Value,
         end: &Value,
@@ -416,7 +515,7 @@ impl Conn {
             .range(rtxn, &(std::ops::Bound::Included(s_key.as_slice()), std::ops::Bound::Included(e_key.as_slice())))?
         {
             let (k, _) = item?;
-            let eid = decode_ave_entity(k)?;
+            let eid = decode_ave_entity(&k)?;
             let (raw_val, _) = dtlv_codec::decode_escaped_bytes(&k[4..k.len() - 8])?;
             let val = decode_value(&raw_val)?;
             out.push((eid, attr.to_owned(), val));
@@ -427,7 +526,7 @@ impl Conn {
     /// Seek AVE datoms for `attr` starting at `>= start`.
     pub fn seek_datoms(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         start: &Value,
     ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
@@ -448,7 +547,7 @@ impl Conn {
             if k.len() < 14 || u32::from_be_bytes(k[0..4].try_into().unwrap()) != aid {
                 break;
             }
-            let eid = decode_ave_entity(k)?;
+            let eid = decode_ave_entity(&k)?;
             let (raw_val, _) = dtlv_codec::decode_escaped_bytes(&k[4..k.len() - 8])?;
             let val = decode_value(&raw_val)?;
             out.push((eid, attr.to_owned(), val));
@@ -459,7 +558,7 @@ impl Conn {
     /// Count entities matching `(attr, val)` via AVE index.
     pub fn count_datoms(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         val: &Value,
     ) -> Result<u64, DatalogError> {
@@ -490,7 +589,7 @@ impl Conn {
 
     pub fn search_vec(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(EntityId, f32)>, DatalogError> {
@@ -500,7 +599,7 @@ impl Conn {
     /// Get all values for `(eid, attr)` (useful for `:db.cardinality/many`).
     pub fn get_attr_many(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         eid: EntityId,
         attr: &str,
     ) -> Result<Vec<Value>, DatalogError> {
@@ -519,7 +618,7 @@ impl Conn {
     /// Pull a map of requested attributes for an EntityId.
     pub fn pull(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         eid: EntityId,
         attr_names: &[&str],
     ) -> Result<BTreeMap<String, Value>, DatalogError> {
@@ -535,7 +634,7 @@ impl Conn {
     /// Full Datalevin-style pull supporting `*`, `:db.cardinality/many`, reverse `:_attr`, and nested refs.
     pub fn pull_pattern(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         eid: EntityId,
         selectors: &[PullSelector],
     ) -> Result<BTreeMap<String, PullValue>, DatalogError> {
@@ -616,9 +715,9 @@ impl Conn {
         Ok(out)
     }
 
-    fn alloc_eid(&self, wtxn: &mut RwTxn) -> Result<EntityId, DatalogError> {
-        let next = match self.meta.get(wtxn, NEXT_EID_KEY)? {
-            Some(b) if b.len() == 8 => u64::from_be_bytes(b.try_into().unwrap()),
+    fn alloc_eid(&self, wtxn: &mut WriteTxn<'_>) -> Result<EntityId, DatalogError> {
+        let next = match self.meta.get_rw(wtxn, NEXT_EID_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
             _ => 1,
         };
         self.meta
@@ -628,22 +727,22 @@ impl Conn {
 
     fn lookup_ave_rw(
         &self,
-        wtxn: &RwTxn,
+        wtxn: &WriteTxn<'_>,
         aid: AttrId,
         val: &Value,
         buf: &mut Vec<u8>,
     ) -> Result<Option<EntityId>, DatalogError> {
         encode_av_prefix(aid, val, buf);
-        if let Some(res) = self.ave.prefix_iter(wtxn, buf)?.next() {
+        if let Some(res) = self.ave.prefix_iter_rw(wtxn, buf)?.next() {
             let (k, _) = res?;
-            return Ok(Some(decode_ave_entity(k)?));
+            return Ok(Some(decode_ave_entity(&k)?));
         }
         Ok(None)
     }
 
     fn remove_ea_cardinality_one(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut WriteTxn<'_>,
         eid: EntityId,
         aid: AttrId,
         spec: &AttrSpec,
@@ -653,7 +752,7 @@ impl Conn {
         encode_ea_prefix(eid, aid, kbuf);
         let existing: Vec<Vec<u8>> = self
             .eav
-            .prefix_iter(wtxn, kbuf)?
+            .prefix_iter_rw(wtxn, kbuf)?
             .map(|r| r.map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
         for old_eav in existing {
@@ -673,14 +772,14 @@ impl Conn {
 
     fn retract_entity_recursive(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut WriteTxn<'_>,
         eid: EntityId,
         ave_buf: &mut Vec<u8>,
     ) -> Result<(), DatalogError> {
         let prefix = eid.to_be_bytes();
         let entries: Vec<Vec<u8>> = self
             .eav
-            .prefix_iter(wtxn, &prefix)?
+            .prefix_iter_rw(wtxn, &prefix)?
             .map(|r| r.map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
         let mut component_children = Vec::new();
@@ -843,7 +942,7 @@ impl Conn {
                     let mut pref = [0u8; 12];
                     pref[..8].copy_from_slice(&eid.to_be_bytes());
                     pref[8..12].copy_from_slice(&aid.to_be_bytes());
-                    let cur = if let Some(res) = self.eav.prefix_iter(&wtxn, &pref)?.next() {
+                    let cur = if let Some(res) = self.eav.prefix_iter_rw(&wtxn, &pref)?.next() {
                         let (k, _) = res?;
                         Some(decode_value(&k[12..])?)
                     } else {
@@ -867,7 +966,7 @@ impl Conn {
 
     fn assert_datom(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut WriteTxn<'_>,
         eid: EntityId,
         attr_name: &str,
         val: &Value,
@@ -913,7 +1012,7 @@ impl Conn {
 
     pub fn fulltext_search(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, f64)>, DatalogError> {
@@ -921,7 +1020,7 @@ impl Conn {
     }
 
     /// Execute a Datalog query using index-nested-loop joins over EAV/AVE/FTS.
-    pub fn q(&self, rtxn: &RoTxn, query: &Query) -> Result<Vec<Vec<Value>>, DatalogError> {
+    pub fn q(&self, rtxn: &ReadTxn<'_>, query: &Query) -> Result<Vec<Vec<Value>>, DatalogError> {
         type Env = HashMap<String, Value>;
         let mut envs: Vec<Env> = vec![HashMap::new()];
         let mut buf = Vec::with_capacity(64);
@@ -988,7 +1087,7 @@ impl Conn {
                                 encode_av_prefix(aid, val, &mut buf);
                                 for item in self.ave.prefix_iter(rtxn, &buf)? {
                                     let (k, _) = item?;
-                                    let eid = decode_ave_entity(k)?;
+                                    let eid = decode_ave_entity(&k)?;
                                     let mut e2 = env.clone();
                                     if let Term::Var(ename) = e_term {
                                         e2.insert(ename.clone(), Value::Ref(eid));
@@ -1059,7 +1158,7 @@ impl Conn {
     /// Execute an EDN Datalog query string (e.g. `"[:find ?isin :in $ ?t :where [?e :sec/ticker ?t] [?e :sec/isin ?isin]]"`).
     pub fn q_str(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query_str: &str,
         inputs: &[Value],
     ) -> Result<QueryResult, DatalogError> {
@@ -1069,7 +1168,7 @@ impl Conn {
     /// Execute an EDN Datalog query string with EDN rule definitions (supports recursive rules, `or`, `not`, aggregates).
     pub fn q_str_with_rules(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         query_str: &str,
         inputs: &[Value],
         rules_str: &str,
@@ -1092,7 +1191,7 @@ impl Conn {
 
     fn finalize_query_result(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         parsed: &ParsedQuery,
         mut envs: Vec<HashMap<String, Value>>,
     ) -> Result<QueryResult, DatalogError> {
@@ -1174,7 +1273,12 @@ impl Conn {
         }
 
         let mut rows = Vec::with_capacity(envs_slice.len());
-        let mut seen = HashSet::new();
+        let dedup = parsed.order_by.is_empty() && envs_slice.len() > 1;
+        let mut seen = if dedup {
+            HashSet::with_capacity(envs_slice.len())
+        } else {
+            HashSet::new()
+        };
         for env in &envs_slice {
             let mut row = Vec::with_capacity(parsed.find.len());
             for elem in &parsed.find {
@@ -1186,7 +1290,7 @@ impl Conn {
                     row.push(val);
                 }
             }
-            if parsed.order_by.is_empty() {
+            if dedup {
                 let key = format!("{:?}", row);
                 if seen.insert(key) {
                     rows.push(row);
@@ -1214,7 +1318,7 @@ impl Conn {
 
     fn eval_all_rules(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         rule_map: &HashMap<String, Vec<RuleDef>>,
     ) -> Result<HashMap<String, Vec<Vec<Value>>>, DatalogError> {
         let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
@@ -1260,7 +1364,7 @@ impl Conn {
 
     fn eval_clauses(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         clauses: &[Clause],
         mut envs: Vec<HashMap<String, Value>>,
         rule_tables: &HashMap<String, Vec<Vec<Value>>>,
@@ -1306,7 +1410,7 @@ impl Conn {
                                 encode_av_prefix(aid, val, &mut buf);
                                 for item in self.ave.prefix_iter(rtxn, &buf)? {
                                     let (k, _) = item?;
-                                    let eid = decode_ave_entity(k)?;
+                                    let eid = decode_ave_entity(&k)?;
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(ename) = e_term {
                                         e2.insert(ename.clone(), Value::Ref(eid));
@@ -1517,13 +1621,13 @@ pub struct PreparedPull<'conn> {
 }
 
 impl<'conn> PreparedPull<'conn> {
-    pub fn execute(&self, rtxn: &RoTxn, eid: EntityId) -> Result<BTreeMap<String, PullValue>, DatalogError> {
+    pub fn execute(&self, rtxn: &ReadTxn<'_>, eid: EntityId) -> Result<BTreeMap<String, PullValue>, DatalogError> {
         self.conn.pull_pattern(rtxn, eid, &self.selectors)
     }
 
     pub fn execute_by_lookup(
         &self,
-        rtxn: &RoTxn,
+        rtxn: &ReadTxn<'_>,
         attr: &str,
         val: &Value,
     ) -> Result<Option<BTreeMap<String, PullValue>>, DatalogError> {
@@ -1542,7 +1646,7 @@ pub struct PreparedQuery<'conn> {
 }
 
 impl<'conn> PreparedQuery<'conn> {
-    pub fn execute(&self, rtxn: &RoTxn, inputs: &[Value]) -> Result<QueryResult, DatalogError> {
+    pub fn execute(&self, rtxn: &ReadTxn<'_>, inputs: &[Value]) -> Result<QueryResult, DatalogError> {
         if self.parsed.in_vars.len() != inputs.len() {
             return Err(DatalogError::Parse(ParseError::InvalidQuery(format!(
                 "expected {} :in arguments, got {}",
