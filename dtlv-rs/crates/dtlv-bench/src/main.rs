@@ -92,7 +92,7 @@ fn bench<F: FnMut(&str)>(tickers: &[String], mut f: F) -> (f64, f64, f64) {
         f(t);
         times_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
     }
-    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     (
         percentile(&times_us, 0.50),
         percentile(&times_us, 0.95),

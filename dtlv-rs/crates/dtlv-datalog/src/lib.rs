@@ -1687,9 +1687,13 @@ fn cmp_vars(env: &HashMap<String, Value>, a: &str, b: &str) -> Option<std::cmp::
     let va = env.get(a)?;
     let vb = env.get(b)?;
     match (va, vb) {
-        (Value::I64(x), Value::I64(y)) | (Value::Instant(x), Value::Instant(y)) => Some(x.cmp(y)),
+        (Value::I64(x), Value::I64(y))
+        | (Value::Instant(x), Value::Instant(y))
+        | (Value::I64(x), Value::Instant(y))
+        | (Value::Instant(x), Value::I64(y)) => Some(x.cmp(y)),
         (Value::F64(x), Value::F64(y)) => x.partial_cmp(y),
-        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Str(x), Value::Str(y)) | (Value::Keyword(x), Value::Keyword(y)) => Some(x.cmp(y)),
+        (Value::Ref(x), Value::Ref(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
