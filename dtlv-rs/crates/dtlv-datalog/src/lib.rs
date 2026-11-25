@@ -58,6 +58,9 @@ pub struct AttrSpec {
     pub excluded_paths: Vec<Vec<PathSeg>>,
     /// Named idoc domain whose selectors apply when this attribute sets none of its own.
     pub idoc_domain: Option<String>,
+    /// `:db/noindex`: values are kept on the entity (pull and entity reads work) but are not in AVE, so
+    /// queries that constrain the value are rejected.
+    pub noindex: bool,
 }
 
 impl AttrSpec {
@@ -74,6 +77,7 @@ impl AttrSpec {
             indexed_paths: None,
             excluded_paths: Vec::new(),
             idoc_domain: None,
+            noindex: false,
         }
     }
 
@@ -86,6 +90,17 @@ impl AttrSpec {
     /// Restricts idoc indexing to paths under these selectors (`:db.idoc/indexedPaths`).
     pub fn idoc_indexed_paths(mut self, paths: Vec<Vec<PathSeg>>) -> Self {
         self.indexed_paths = Some(paths);
+        self
+    }
+
+    /// Keeps the attribute out of the value index. Entity and pull reads still see it; value-constrained queries
+    /// are rejected rather than scanning.
+    /// Unique attributes stay indexed, as in Datalevin.
+    pub fn noindex(mut self) -> Self {
+        self.noindex = true;
+        if self.unique.is_none() {
+            self.index = false;
+        }
         self
     }
 
@@ -2148,6 +2163,9 @@ impl Conn {
                 Clause::Datom(e_term, attr_name, v_term) => {
                     let aid = self.attr_id(attr_name)?;
                     let spec = &self.attrs[&aid];
+                    if spec.noindex && !matches!(v_term, ExprTerm::Var(_) | ExprTerm::Wildcard) {
+                        return Err(DatalogError::Type(format!("{attr_name} is :db/noindex; value conditions cannot use it")));
+                    }
                     for env in &envs {
                         let bound_e: Option<EntityId> = match e_term {
                             ExprTerm::Val(v) => v.as_ref(),
