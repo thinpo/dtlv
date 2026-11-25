@@ -449,12 +449,30 @@ impl FullTextIndex {
 
     /// Evaluates a query tree and returns the top `limit` entities by score.
     pub fn search_query(&self, rtxn: &ReadTxn<'_>, query: &Query, limit: usize) -> Result<Vec<(EntityId, f64)>, KvError> {
+        self.search_page(rtxn, query, 0, limit, None)
+    }
+
+    /// Evaluates a query tree, drops entities `filter` rejects, and returns ranks `offset .. offset + limit`.
+    /// Ties are broken by ascending entity id, so pages of an unchanged index never overlap or skip.
+    pub fn search_page(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query: &Query,
+        offset: usize,
+        limit: usize,
+        filter: Option<&dyn Fn(EntityId) -> bool>,
+    ) -> Result<Vec<(EntityId, f64)>, KvError> {
         let stats = self.stats(rtxn)?;
         if stats.n_docs == 0.0 {
             return Ok(Vec::new());
         }
-        let scores = self.eval(rtxn, query, stats)?;
-        Ok(rank(scores.into_iter().collect(), limit))
+        let mut scores = self.eval(rtxn, query, stats)?;
+        if let Some(keep) = filter {
+            scores.retain(|eid, _| keep(*eid));
+        }
+        let mut ranked = rank(scores.into_iter().collect(), offset.saturating_add(limit));
+        ranked.drain(..offset.min(ranked.len()));
+        Ok(ranked)
     }
 
     /// Document-level search for free text: `(document key, score)` sorted descending. The key starts with

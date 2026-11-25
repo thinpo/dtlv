@@ -156,6 +156,8 @@ fn encode_item(out: &mut Vec<u8>, item: &TxItem) {
         }
         // Calls are expanded before logging; a logged `Call` would have no replayable meaning.
         TxItem::Call(..) => unreachable!("transaction calls are logged as the items they produced"),
+        // Ensures are checked before commit and never logged, so replay never needs the predicate.
+        TxItem::Ensure(..) => unreachable!("ensure checks are not logged"),
     }
 }
 

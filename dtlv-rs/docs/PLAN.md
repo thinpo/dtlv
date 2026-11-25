@@ -69,11 +69,13 @@ Known limits to keep: rules with `or`, `not`, or nested queries still fall back 
   restart and caught up from the log; ~160 KB per 1k dim-8 vectors). Open: quantization, `vec-neighbors` as a query
   function, automatic saving.
 - Idoc: array values inside patterns done (containment semantics).
-- Transactions: `with` simulation and `:db/ensure`.
+- Transactions: `with` simulation. `:db/ensure` is done (`TxItem::Ensure`, `register_ensure_fn`; runs at end of tx
+  on uncommitted state; not logged, so replay never needs the predicate; no EDN tx parser exists to wire it into).
 - Schema: changing cardinality or uniqueness in place is done (`update_schema`, validated against existing data;
   tests `schema_change_test`). Attribute specs are not persisted, so callers must pass the new spec to `open`.
 - Durability: segmented txlog, automatic checkpoints and retention, env flags for no-sync writes, group commit.
-- Search: custom analyzers, doc filters and paging. Prefix and fuzzy terms are done (`[:prefix "s"]`,
+- Search: custom analyzers. Paging and entity filters are done (`fulltext_query_page`; filter runs before ranking;
+  ties by entity id). Prefix and fuzzy terms are done (`[:prefix "s"]`,
   `[:fuzzy "s" d]`, d <= 2; matched against stemmed index terms; fuzzy scans the term dictionary).
 - Transactions: `with` needs reads through an uncommitted write txn, which no backend's `ReadTxn` supports; needs
   a design (overlay or per-backend read-through) before it can be specced.

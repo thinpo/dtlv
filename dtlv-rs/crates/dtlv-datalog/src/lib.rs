@@ -199,6 +199,10 @@ pub enum DatalogError {
     Type(String),
     #[error("write-ahead log error: {0}")]
     Wal(String),
+    #[error("unknown ensure predicate: {0}")]
+    UnknownEnsureFn(String),
+    #[error("ensure {pred} failed for arguments {args:?}")]
+    EnsureFailed { pred: String, args: Vec<Value> },
 }
 
 /// Removes the given suffixed variants of a SQLite path (e.g. `""`, `"-wal"`, `"-shm"`);
@@ -265,6 +269,9 @@ pub enum TxItem {
     PatchIdoc(EntityId, String, Vec<PatchOp>),
     /// `:db.fn/patchIdoc` on a cardinality-many attribute: `old` identifies which stored document to patch.
     PatchIdocOf(EntityId, String, Value, Vec<PatchOp>),
+    /// `:db/ensure`: checks a registered predicate against the transaction's own state before commit; a false
+    /// result fails the whole transaction. Never written to the WAL.
+    Ensure(String, Vec<TxVal>),
 }
 
 /// Read view handed to a transaction function. Sees the in-progress transaction.
@@ -284,6 +291,20 @@ impl TxView<'_, '_> {
         let mut buf = Vec::new();
         self.conn.lookup_ave_rw(self.wtxn, aid, val, &mut buf)
     }
+
+    /// Every value of `(eid, attr)`, for cardinality-many attributes.
+    pub fn get_all(&self, eid: EntityId, attr: &str) -> Result<Vec<Value>, DatalogError> {
+        let aid = self.conn.attr_id(attr)?;
+        let mut pref = [0u8; 12];
+        pref[..8].copy_from_slice(&eid.to_be_bytes());
+        pref[8..12].copy_from_slice(&aid.to_be_bytes());
+        let mut out = Vec::new();
+        for res in self.conn.eav.prefix_iter_rw(self.wtxn, &pref)? {
+            let (k, _) = res?;
+            out.push(decode_value(&k[12..])?);
+        }
+        Ok(out)
+    }
 }
 
 /// A user function callable from query clauses: `[(name ?x ...) ?out]`. `None` is nil.
@@ -297,6 +318,8 @@ pub struct IdocDomain {
 pub type QueryFn = Box<dyn Fn(&[Value]) -> Result<Option<Value>, DatalogError>>;
 
 pub type TxFn = Box<dyn Fn(&TxView<'_, '_>, &[Value]) -> Result<Vec<TxItem>, DatalogError>>;
+
+pub type EnsureFn = Box<dyn Fn(&TxView<'_, '_>, &[Value]) -> Result<bool, DatalogError>>;
 
 /// One datom added (`added: true`) or retracted by a committed transaction.
 #[derive(Debug, Clone, PartialEq)]
@@ -317,6 +340,8 @@ pub struct TxReport {
 struct TxState {
     /// Items as applied (calls expanded), kept only when a WAL is attached.
     logged: Option<Vec<TxItem>>,
+    /// Ensure predicates to run once all items are applied.
+    ensures: Vec<(String, Vec<TxVal>)>,
     changes: Vec<TxDatum>,
     touched: Vec<EntityId>,
     tempids: HashMap<String, EntityId>,
@@ -394,6 +419,7 @@ pub struct Conn {
     tuple_specs: Vec<(String, AttrId, Vec<AttrId>)>,
     tuple_targets: HashSet<AttrId>,
     tx_fns: HashMap<String, TxFn>,
+    ensure_fns: HashMap<String, EnsureFn>,
     idoc_idx: RawDb,
     idoc_jobs: RawDb,
     wal: std::sync::Mutex<Option<wal::Wal>>,
@@ -522,6 +548,7 @@ impl Conn {
             tuple_specs,
             tuple_targets,
             tx_fns: HashMap::new(),
+            ensure_fns: HashMap::new(),
             idoc_idx,
             idoc_jobs,
             wal: std::sync::Mutex::new(None),
@@ -1164,6 +1191,7 @@ impl Conn {
             self.apply_item(&mut wtxn, item, &mut st)?;
         }
         self.recompute_tuples(&mut wtxn, &st.touched, &mut st.changes)?;
+        self.check_ensures(&wtxn, &st.tempids, &st.ensures)?;
         let mut logged_lsn = None;
         if let Some(lsn) = replay {
             self.set_applied_lsn(&mut wtxn, lsn)?;
@@ -1258,11 +1286,12 @@ impl Conn {
 
     fn apply_item(&self, wtxn: &mut WriteTxn<'_>, item: &TxItem, st: &mut TxState) -> Result<(), DatalogError> {
         if let Some(log) = st.logged.as_mut() {
-            if !matches!(item, TxItem::Call(..)) {
+            if !matches!(item, TxItem::Call(..) | TxItem::Ensure(..)) {
                 log.push(item.clone());
             }
         }
         match item {
+            TxItem::Ensure(name, args) => st.ensures.push((name.clone(), args.clone())),
             TxItem::Assert(explicit_eid, pairs) => {
                 self.reject_tuple_writes(pairs.iter().map(|(a, _)| a.as_str()))?;
                 let mut resolved_eid = *explicit_eid;
@@ -1474,6 +1503,38 @@ impl Conn {
         Ok(())
     }
 
+    /// Runs the ensure predicates of a transaction against its uncommitted state. Any false result, unknown
+    /// predicate or unresolvable argument aborts the transaction before anything is logged or committed.
+    fn check_ensures(
+        &self,
+        wtxn: &WriteTxn<'_>,
+        tempids: &HashMap<String, EntityId>,
+        ensures: &[(String, Vec<TxVal>)],
+    ) -> Result<(), DatalogError> {
+        let view = TxView { conn: self, wtxn };
+        for (name, args) in ensures {
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                vals.push(match arg {
+                    TxVal::Val(v) => v.clone(),
+                    TxVal::TempRef(t) => {
+                        let id = tempids.get(t).ok_or_else(|| DatalogError::Type(format!("ensure {name}: unresolved tempid {t}")))?;
+                        Value::Ref(*id)
+                    }
+                    TxVal::LookupRef(attr, v) => {
+                        let id = view.lookup(attr, v)?.ok_or_else(|| DatalogError::Type(format!("ensure {name}: no entity for {attr}")))?;
+                        Value::Ref(id)
+                    }
+                });
+            }
+            let f = self.ensure_fns.get(name).ok_or_else(|| DatalogError::UnknownEnsureFn(name.clone()))?;
+            if !f(&view, &vals)? {
+                return Err(DatalogError::EnsureFailed { pred: name.clone(), args: vals });
+            }
+        }
+        Ok(())
+    }
+
     /// Re-derives every composite tuple attribute of the touched entities from its source attributes.
     fn recompute_tuples(
         &self,
@@ -1576,6 +1637,15 @@ impl Conn {
         self.tx_fns.insert(name.to_owned(), Box::new(f));
     }
 
+    /// Registers a `:db/ensure` predicate. Arguments are resolved to values before the call (tempids and lookup
+    /// refs become `Value::Ref`). Returning `Ok(false)` fails the transaction. Not persisted: re-register on open.
+    pub fn register_ensure_fn<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&TxView<'_, '_>, &[Value]) -> Result<bool, DatalogError> + 'static,
+    {
+        self.ensure_fns.insert(name.to_owned(), Box::new(f));
+    }
+
     fn assert_datom(
         &self,
         wtxn: &mut WriteTxn<'_>,
@@ -1665,6 +1735,19 @@ impl Conn {
         limit: usize,
     ) -> Result<Vec<(EntityId, f64)>, DatalogError> {
         Ok(self.fts.search_query(rtxn, query, limit)?)
+    }
+
+    /// Like `fulltext_query`, but returns ranks `offset .. offset + limit`. `filter` runs before ranking,
+    /// so a filtered page is full whenever enough entities match. Pages are stable for an unchanged index.
+    pub fn fulltext_query_page(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query: &FtsQuery,
+        offset: usize,
+        limit: usize,
+        filter: Option<&dyn Fn(dtlv_codec::EntityId) -> bool>,
+    ) -> Result<Vec<(dtlv_codec::EntityId, f64)>, DatalogError> {
+        Ok(self.fts.search_page(rtxn, query, offset, limit, filter)?)
     }
 
     pub fn fulltext_search(
