@@ -563,7 +563,7 @@ impl Conn {
             if let Ok(aid) = dst.attr_id(&attr_name) {
                 if dst.attrs[&aid].fulltext {
                     if let Some(txt) = val.as_str() {
-                        dst.fts.index_doc(&mut fwtxn, eid, txt)?;
+                        dst.fts.index_entry(&mut fwtxn, &fts_key(eid, aid, &val), txt)?;
                     }
                 }
             }
@@ -988,6 +988,9 @@ impl Conn {
             if let (true, Value::Doc(text)) = (spec.idoc, &old_val) {
                 self.idoc_del(wtxn, aid, eid, text)?;
             }
+            if spec.fulltext {
+                self.fts.remove_entry(wtxn, &fts_key(eid, aid, &old_val))?;
+            }
             changes.push(TxDatum { eid, attr: spec.name.clone(), value: old_val.clone(), added: false });
             if spec.index {
                 encode_ave_key(aid, &old_val, eid, ave_buf);
@@ -1043,7 +1046,6 @@ impl Conn {
             .map(|r| r.map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
         let mut component_children = Vec::new();
-        let mut had_fulltext = false;
         for k in entries {
             let aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
             let val = decode_value(&k[12..])?;
@@ -1058,7 +1060,7 @@ impl Conn {
                     self.ave.delete(wtxn, ave_buf)?;
                 }
                 if spec.fulltext {
-                    had_fulltext = true;
+                    self.fts.remove_entry(wtxn, &fts_key(eid, aid, &val))?;
                 }
                 if spec.is_component {
                     if let Value::Ref(child) = val {
@@ -1070,9 +1072,6 @@ impl Conn {
                 encode_vae_key(target, aid, eid, ave_buf);
                 self.vae.delete(wtxn, ave_buf)?;
             }
-        }
-        if had_fulltext {
-            self.fts.remove_doc(wtxn, eid)?;
         }
         for child in component_children {
             self.retract_entity_recursive(wtxn, child, ave_buf, changes)?;
@@ -1313,7 +1312,7 @@ impl Conn {
                     self.vae.delete(wtxn, &st.ave_buf)?;
                 }
                 if spec.fulltext {
-                    self.fts.remove_doc(wtxn, *eid)?;
+                    self.fts.remove_entry(wtxn, &fts_key(*eid, aid, val))?;
                 }
                 st.touched.push(*eid);
             }
@@ -1322,9 +1321,6 @@ impl Conn {
                 let aid = self.attr_id(attr_name)?;
                 let spec = &self.attrs[&aid];
                 self.remove_ea_values(wtxn, *eid, aid, spec, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
-                if spec.fulltext {
-                    self.fts.remove_doc(wtxn, *eid)?;
-                }
                 st.touched.push(*eid);
             }
             TxItem::RetractEntity(eid) => {
@@ -1497,7 +1493,7 @@ impl Conn {
             return Err(DatalogError::Type(format!("{attr_name} is an idoc attribute; use idoc_value")));
         }
 
-        if let Some(u) = spec.unique {
+        if spec.unique.is_some() {
             if let Some(existing) = self.lookup_ave_rw(wtxn, aid, val, ave_buf)? {
                 // An identity value resolves to its entity before this point, so a different entity here
                 // means an explicit id conflicts with the unique value: reject it for both kinds.
@@ -1531,7 +1527,7 @@ impl Conn {
         }
         if spec.fulltext {
             if let Some(text) = val.as_str() {
-                self.fts.index_doc(wtxn, eid, text)?;
+                self.fts.index_entry(wtxn, &fts_key(eid, aid, val), text)?;
             }
         }
         Ok(())
@@ -1579,7 +1575,7 @@ impl Conn {
             let mut next_envs = Vec::new();
             match pat {
                 Pattern::Fulltext(q_str, e_var) => {
-                    let hits = self.fts.search(rtxn, q_str, 100)?;
+                    let hits = self.fts.search(rtxn, q_str, usize::MAX)?;
                     for env in &envs {
                         for &(eid, _) in &hits {
                             let mut e2 = env.clone();
@@ -2337,6 +2333,15 @@ impl Conn {
     }
 }
 
+/// Full-text document key for one datom: entity id, attribute id, then the encoded value. Each datom is
+/// its own document, so an entity's other values and attributes stay indexed when one is removed.
+fn fts_key(eid: EntityId, aid: AttrId, val: &Value) -> Vec<u8> {
+    let mut key = eid.to_be_bytes().to_vec();
+    key.extend_from_slice(&aid.to_be_bytes());
+    encode_value(val, &mut key);
+    key
+}
+
 /// Binds `var` to `val`, or checks equality if it is already bound. Returns false on conflict.
 fn bind_var(env: &mut HashMap<String, Value>, var: &str, val: Value) -> bool {
     match env.get(var) {
@@ -2823,14 +2828,13 @@ impl Conn {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
-        let hits = self.fts.search(rtxn, query, limit)?;
-        let names: Vec<String> = self.attrs.values().filter(|s| s.fulltext).map(|s| s.name.clone()).collect();
         let mut out = Vec::new();
-        for (eid, _) in hits {
-            for name in &names {
-                if let Some(val) = self.get_attr(rtxn, eid, name)? {
-                    out.push((eid, name.clone(), val));
-                }
+        for (doc, _) in self.fts.search_docs(rtxn, query, limit)? {
+            let eid = dtlv_search::fulltext::doc_entity(&doc);
+            let aid = u32::from_be_bytes(doc[8..12].try_into().unwrap());
+            let val = decode_value(&doc[12..])?;
+            if let Some(name) = self.aid_names.get(&aid) {
+                out.push((eid, name.clone(), val));
             }
         }
         Ok(out)
@@ -2940,7 +2944,7 @@ impl Conn {
                     self.vae.delete(&mut wtxn, &ave_buf)?;
                 }
                 if spec.as_ref().is_some_and(|s| s.fulltext) {
-                    self.fts.remove_doc(&mut wtxn, eid)?;
+                    self.fts.remove_entry(&mut wtxn, &fts_key(eid, aid, &val))?;
                 }
             }
             let mut key = b"attr:".to_vec();
@@ -2981,7 +2985,7 @@ impl Conn {
                     }
                     if spec.fulltext {
                         if let Some(text) = val.as_str() {
-                            self.fts.index_doc(&mut wtxn, eid, text)?;
+                            self.fts.index_entry(&mut wtxn, &fts_key(eid, aid, &val), text)?;
                         }
                     }
                 }

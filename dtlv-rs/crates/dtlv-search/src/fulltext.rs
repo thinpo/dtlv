@@ -101,17 +101,22 @@ fn read_u64_rw(db: &RawDb, wtxn: &WriteTxn<'_>, key: &[u8]) -> Result<u64, KvErr
     })
 }
 
-fn posting_key(term: &str, eid: EntityId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(term.len() + 9);
+fn posting_key(term: &str, doc: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(term.len() + 1 + doc.len());
     key.extend_from_slice(term.as_bytes());
     key.push(0x00);
-    key.extend_from_slice(&eid.to_be_bytes());
+    key.extend_from_slice(doc);
     key
+}
+
+/// Entity id of a document key (its first eight bytes).
+pub fn doc_entity(doc: &[u8]) -> EntityId {
+    u64::from_be_bytes(doc[..8].try_into().expect("document keys start with an entity id"))
 }
 
 /// Posting value: term frequency (u32 BE), then one u32 BE position per occurrence when positions are kept.
 struct Posting {
-    eid: EntityId,
+    doc: Vec<u8>,
     tf: u32,
     positions: Vec<u32>,
 }
@@ -158,20 +163,19 @@ impl FullTextIndex {
         Ok(())
     }
 
-    /// Remove an entity's previous full-text postings and adjust global stats.
-    pub fn remove_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
-        let eid_key = eid.to_be_bytes();
-        let old_len = read_u64_rw(&self.doc_lens, wtxn, &eid_key)?;
-        if let Some(blob) = self.doc_terms.get_rw(wtxn, &eid_key)? {
+    /// Removes one indexed document (a datom's text, keyed by `doc`) and adjusts global stats.
+    pub fn remove_entry(&self, wtxn: &mut WriteTxn<'_>, doc: &[u8]) -> Result<(), KvError> {
+        let old_len = read_u64_rw(&self.doc_lens, wtxn, doc)?;
+        if let Some(blob) = self.doc_terms.get_rw(wtxn, doc)? {
             let terms_bytes = blob.to_vec();
             for term_slice in terms_bytes.split(|&b| b == 0x00) {
                 if !term_slice.is_empty() {
-                    let key = posting_key(std::str::from_utf8(term_slice).unwrap_or_default(), eid);
+                    let key = posting_key(std::str::from_utf8(term_slice).unwrap_or_default(), doc);
                     self.postings.delete(wtxn, &key)?;
                 }
             }
-            self.doc_terms.delete(wtxn, &eid_key)?;
-            self.doc_lens.delete(wtxn, &eid_key)?;
+            self.doc_terms.delete(wtxn, doc)?;
+            self.doc_lens.delete(wtxn, doc)?;
 
             let n = read_u64_rw(&self.meta, wtxn, DOC_COUNT_KEY)?;
             let total = read_u64_rw(&self.meta, wtxn, TOTAL_LEN_KEY)?;
@@ -181,9 +185,23 @@ impl FullTextIndex {
         Ok(())
     }
 
-    pub fn index_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, text: &str) -> Result<(), KvError> {
-        // Re-indexing replaces the entity's previous text.
-        self.remove_doc(wtxn, eid)?;
+    /// Removes every document of an entity (all of its fulltext values). Prefer `remove_entry` per datom.
+    pub fn remove_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
+        let docs: Vec<Vec<u8>> = self
+            .doc_lens
+            .prefix_iter_rw(wtxn, &eid.to_be_bytes())?
+            .map(|r| r.map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for doc in docs {
+            self.remove_entry(wtxn, &doc)?;
+        }
+        Ok(())
+    }
+
+    /// Indexes `text` as the document `doc`. Re-indexing the same key replaces its text. `doc` must start
+    /// with the entity id, so several values of one entity stay separate documents.
+    pub fn index_entry(&self, wtxn: &mut WriteTxn<'_>, doc: &[u8], text: &str) -> Result<(), KvError> {
+        self.remove_entry(wtxn, doc)?;
 
         let tokens = analyze(text, self.cfg);
         if tokens.is_empty() {
@@ -201,19 +219,23 @@ impl FullTextIndex {
                     value.extend_from_slice(&p.to_be_bytes());
                 }
             }
-            self.postings.put(wtxn, &posting_key(term, eid), &value)?;
+            self.postings.put(wtxn, &posting_key(term, doc), &value)?;
         }
-        let eid_key = eid.to_be_bytes();
         let doc_len = tokens.len() as u64;
-        self.doc_lens.put(wtxn, &eid_key, &doc_len.to_be_bytes())?;
+        self.doc_lens.put(wtxn, doc, &doc_len.to_be_bytes())?;
         let unique: Vec<&str> = by_term.keys().copied().collect();
-        self.doc_terms.put(wtxn, &eid_key, unique.join("\0").as_bytes())?;
+        self.doc_terms.put(wtxn, doc, unique.join("\0").as_bytes())?;
 
         let n = read_u64_rw(&self.meta, wtxn, DOC_COUNT_KEY)? + 1;
         let total = read_u64_rw(&self.meta, wtxn, TOTAL_LEN_KEY)? + doc_len;
         self.meta.put(wtxn, DOC_COUNT_KEY, &n.to_be_bytes())?;
         self.meta.put(wtxn, TOTAL_LEN_KEY, &total.to_be_bytes())?;
         Ok(())
+    }
+
+    /// Indexes an entity's whole text as one document (the entity-only key).
+    pub fn index_doc(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, text: &str) -> Result<(), KvError> {
+        self.index_entry(wtxn, &eid.to_be_bytes(), text)
     }
 
     fn stats(&self, rtxn: &ReadTxn<'_>) -> Result<Stats, KvError> {
@@ -230,48 +252,61 @@ impl FullTextIndex {
         let mut out = Vec::new();
         for item in self.postings.prefix_iter(rtxn, &prefix)? {
             let (k, v) = item?;
-            if k.len() < prefix.len() + 8 || v.len() < 4 {
+            if k.len() <= prefix.len() || v.len() < 4 {
                 continue;
             }
-            let eid = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
             let tf = u32::from_be_bytes(v[0..4].try_into().unwrap());
             let positions = v[4..].chunks_exact(4).map(|c| u32::from_be_bytes(c.try_into().unwrap())).collect();
-            out.push(Posting { eid, tf, positions });
+            out.push(Posting { doc: k[prefix.len()..].to_vec(), tf, positions });
         }
         Ok(out)
     }
 
-    /// BM25 contributions of one term, keyed by entity.
-    fn bm25_term(&self, rtxn: &ReadTxn<'_>, stats: Stats, postings: &[Posting]) -> Result<HashMap<EntityId, f64>, KvError> {
+    /// BM25 contributions of one term, keyed by document.
+    fn bm25_term(&self, rtxn: &ReadTxn<'_>, stats: Stats, postings: &[Posting]) -> Result<HashMap<Vec<u8>, f64>, KvError> {
         let df = postings.len() as f64;
         let idf = ((stats.n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
         let mut out = HashMap::with_capacity(postings.len());
         for p in postings {
-            let dl = read_u64(&self.doc_lens, rtxn, &p.eid.to_be_bytes())? as f64;
+            let dl = read_u64(&self.doc_lens, rtxn, &p.doc)? as f64;
             let tf = p.tf as f64;
             let denom = tf + K1 * (1.0 - B + B * (dl / stats.avg_dl));
-            out.insert(p.eid, idf * (tf * (K1 + 1.0)) / denom);
+            out.insert(p.doc.clone(), idf * (tf * (K1 + 1.0)) / denom);
         }
         Ok(out)
     }
 
+    /// Documents matching one exact term, with BM25 scores.
+    fn term_docs(&self, rtxn: &ReadTxn<'_>, term: &str, stats: Stats) -> Result<HashMap<Vec<u8>, f64>, KvError> {
+        let postings = self.postings_of(rtxn, term)?;
+        if postings.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.bm25_term(rtxn, stats, &postings)
+    }
+
+    /// Collapses document scores to entities: an entity's score is the sum over its matching documents.
+    fn collapse(docs: HashMap<Vec<u8>, f64>) -> HashMap<EntityId, f64> {
+        let mut out: HashMap<EntityId, f64> = HashMap::new();
+        for (doc, score) in docs {
+            *out.entry(doc_entity(&doc)).or_insert(0.0) += score;
+        }
+        out
+    }
+
+    /// Entity-level evaluation. Leaves match documents and collapse to entities, so boolean operators see
+    /// each entity once no matter how many of its values match.
     fn eval(&self, rtxn: &ReadTxn<'_>, q: &Query, stats: Stats) -> Result<HashMap<EntityId, f64>, KvError> {
         match q {
             Query::Text(text) => {
                 let mut out: HashMap<EntityId, f64> = HashMap::new();
                 for (term, _) in analyze(text, self.cfg) {
-                    merge_or(&mut out, self.eval(rtxn, &Query::Term(term), stats)?);
+                    merge_or(&mut out, Self::collapse(self.term_docs(rtxn, &term, stats)?));
                 }
                 Ok(out)
             }
-            Query::Term(term) => {
-                let postings = self.postings_of(rtxn, term)?;
-                if postings.is_empty() {
-                    return Ok(HashMap::new());
-                }
-                self.bm25_term(rtxn, stats, &postings)
-            }
-            Query::Phrase(text) => self.eval_phrase(rtxn, text, stats),
+            Query::Term(term) => Ok(Self::collapse(self.term_docs(rtxn, term, stats)?)),
+            Query::Phrase(text) => Ok(Self::collapse(self.eval_phrase(rtxn, text, stats)?)),
             Query::Or(qs) => {
                 let mut out = HashMap::new();
                 for sub in qs {
@@ -301,11 +336,9 @@ impl FullTextIndex {
                 let mut out = HashMap::new();
                 for item in self.doc_lens.iter(rtxn)? {
                     let (k, _) = item?;
-                    if k.len() == 8 {
-                        let eid = u64::from_be_bytes(k[..].try_into().unwrap());
-                        if !excluded.contains_key(&eid) {
-                            out.insert(eid, 0.0);
-                        }
+                    let eid = doc_entity(&k);
+                    if !excluded.contains_key(&eid) {
+                        out.insert(eid, 0.0);
                     }
                 }
                 Ok(out)
@@ -314,7 +347,7 @@ impl FullTextIndex {
     }
 
     /// Documents containing the analyzed phrase at consecutive positions (after stopword gaps).
-    fn eval_phrase(&self, rtxn: &ReadTxn<'_>, text: &str, stats: Stats) -> Result<HashMap<EntityId, f64>, KvError> {
+    fn eval_phrase(&self, rtxn: &ReadTxn<'_>, text: &str, stats: Stats) -> Result<HashMap<Vec<u8>, f64>, KvError> {
         if !self.cfg.index_positions {
             return Err(KvError::Config("phrase search requires index_positions".into()));
         }
@@ -322,37 +355,37 @@ impl FullTextIndex {
         let Some(&(_, base)) = tokens.first() else {
             return Ok(HashMap::new());
         };
-        let mut per_term: Vec<(u32, HashMap<EntityId, Vec<u32>>, Vec<Posting>)> = Vec::new();
+        let mut per_term: Vec<(u32, HashMap<Vec<u8>, Vec<u32>>, Vec<Posting>)> = Vec::new();
         for (term, pos) in &tokens {
             let postings = self.postings_of(rtxn, term)?;
             if postings.is_empty() {
                 return Ok(HashMap::new());
             }
-            let by_doc = postings.iter().map(|p| (p.eid, p.positions.clone())).collect();
+            let by_doc = postings.iter().map(|p| (p.doc.clone(), p.positions.clone())).collect();
             per_term.push((pos - base, by_doc, postings));
         }
-        // Candidate docs contain every term; keep those where some start position lines the terms up.
-        let mut candidates: HashSet<EntityId> = per_term[0].1.keys().copied().collect();
+        // Candidate documents contain every term; keep those where some start position lines the terms up.
+        let mut candidates: HashSet<Vec<u8>> = per_term[0].1.keys().cloned().collect();
         for (_, by_doc, _) in per_term.iter().skip(1) {
-            candidates.retain(|eid| by_doc.contains_key(eid));
+            candidates.retain(|doc| by_doc.contains_key(doc));
         }
-        let mut hits: Vec<EntityId> = Vec::new();
-        for eid in candidates {
-            let starts = per_term[0].1.get(&eid).cloned().unwrap_or_default();
+        let mut hits: Vec<Vec<u8>> = Vec::new();
+        for doc in candidates {
+            let starts = per_term[0].1.get(&doc).cloned().unwrap_or_default();
             let matched = starts.iter().any(|&p0| {
-                per_term.iter().all(|(offset, by_doc, _)| {
-                    by_doc.get(&eid).is_some_and(|ps| ps.contains(&(p0 + offset)))
-                })
+                per_term
+                    .iter()
+                    .all(|(offset, by_doc, _)| by_doc.get(&doc).is_some_and(|ps| ps.contains(&(p0 + offset))))
             });
             if matched {
-                hits.push(eid);
+                hits.push(doc);
             }
         }
-        let mut out: HashMap<EntityId, f64> = HashMap::new();
+        let mut out: HashMap<Vec<u8>, f64> = HashMap::new();
         for (_, _, postings) in &per_term {
             let scores = self.bm25_term(rtxn, stats, postings)?;
-            for eid in &hits {
-                *out.entry(*eid).or_insert(0.0) += scores.get(eid).copied().unwrap_or(0.0);
+            for doc in &hits {
+                *out.entry(doc.clone()).or_insert(0.0) += scores.get(doc).copied().unwrap_or(0.0);
             }
         }
         Ok(out)
@@ -363,18 +396,44 @@ impl FullTextIndex {
         self.search_query(rtxn, &Query::Text(query.to_owned()), limit)
     }
 
-    /// Evaluates a query tree and returns the top `limit` documents by score.
+    /// Evaluates a query tree and returns the top `limit` entities by score.
     pub fn search_query(&self, rtxn: &ReadTxn<'_>, query: &Query, limit: usize) -> Result<Vec<(EntityId, f64)>, KvError> {
         let stats = self.stats(rtxn)?;
         if stats.n_docs == 0.0 {
             return Ok(Vec::new());
         }
         let scores = self.eval(rtxn, query, stats)?;
-        let mut ranked: Vec<(EntityId, f64)> = scores.into_iter().collect();
+        Ok(rank(scores.into_iter().collect(), limit))
+    }
+
+    /// Document-level search for free text: `(document key, score)` sorted descending. The key starts with
+    /// the entity id and carries whatever suffix the indexer chose (for datoms: attribute and value).
+    pub fn search_docs(&self, rtxn: &ReadTxn<'_>, query: &str, limit: usize) -> Result<Vec<(Vec<u8>, f64)>, KvError> {
+        let stats = self.stats(rtxn)?;
+        if stats.n_docs == 0.0 {
+            return Ok(Vec::new());
+        }
+        let mut docs: HashMap<Vec<u8>, f64> = HashMap::new();
+        for (term, _) in analyze(query, self.cfg) {
+            for (doc, score) in self.term_docs(rtxn, &term, stats)? {
+                *docs.entry(doc).or_insert(0.0) += score;
+            }
+        }
+        let mut ranked: Vec<(Vec<u8>, f64)> = docs.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
         ranked.truncate(limit);
         Ok(ranked)
     }
+}
+
+/// Sorts `(id, score)` pairs by descending score, breaking ties by id, and keeps the top `limit`.
+fn rank<K: Ord + Clone>(mut items: Vec<(K, f64)>, limit: usize) -> Vec<(EntityId, f64)>
+where
+    K: Into<EntityId>,
+{
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items.into_iter().map(|(k, s)| (k.into(), s)).collect()
 }
 
 fn merge_or(into: &mut HashMap<EntityId, f64>, from: HashMap<EntityId, f64>) {
