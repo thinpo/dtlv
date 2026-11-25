@@ -3229,10 +3229,18 @@ impl Conn {
 
     /// Adds attributes, deletes attributes (with their datoms), and renames attributes.
     ///
-    /// Adding a name that already exists is a no-op when the spec is identical. An existing attribute
-    /// may only gain `index` or `fulltext`, which backfills existing datoms. Other property changes are
-    /// rejected. Renames keep the internal attribute id, so no datoms are rewritten. Validation runs
-    /// before any write, and in-memory state changes only after the commit succeeds.
+    /// Adding a name that already exists is a no-op when the spec is identical. For an existing attribute
+    /// these changes are allowed, in place:
+    /// - `cardinality` one to many (always).
+    /// - `cardinality` many to one, only if no entity holds more than one value.
+    /// - `unique` none to value or identity, only if no two entities share a value. Backfills AVE entries.
+    /// - `unique` value or identity to another kind, or to none (always). AVE entries are kept, not deleted.
+    /// - gaining `index` or `fulltext`, which backfills existing datoms. Dropping `index` or `fulltext`
+    ///   is rejected, except for an index that only came from `unique`.
+    ///
+    /// Changes to `is_component` or `tuple_sources` are rejected. Renames keep the internal attribute id,
+    /// so no datoms are rewritten. Validation runs before any write, and in-memory state changes only
+    /// after the commit succeeds. Attribute specs are not persisted; the caller passes them to `open`.
     pub fn update_schema(
         &mut self,
         add: Vec<AttrSpec>,
@@ -3254,8 +3262,10 @@ impl Conn {
                 return Err(DatalogError::Schema(format!("cannot rename {old} to {new}")));
             }
         }
-        // Each add: (spec, existing aid if the attribute already exists and needs an index/fulltext backfill)
+        // Each add: (stored spec, existing aid if the attribute already exists and its schema changes)
         let mut plan: Vec<(AttrSpec, Option<AttrId>)> = Vec::new();
+        // Existing attributes whose datoms must be scanned first: (aid, name, check one value per entity, check unique)
+        let mut checks: Vec<(AttrId, String, bool, bool)> = Vec::new();
         for spec in add {
             if spec.tuple_sources.is_some() {
                 return Err(DatalogError::Schema(format!(
@@ -3267,27 +3277,63 @@ impl Conn {
                 None => plan.push((spec, None)),
                 Some(aid) => {
                     let old = self.attrs.get(&aid).cloned().unwrap_or_else(|| AttrSpec::new(spec.name.clone()));
-                    if old.cardinality == spec.cardinality
-                        && old.unique == spec.unique
-                        && old.is_component == spec.is_component
-                        && old.tuple_sources == spec.tuple_sources
-                        && (!old.index || spec.index)
-                        && (!old.fulltext || spec.fulltext)
-                    {
-                        if old.index != spec.index || old.fulltext != spec.fulltext {
-                            plan.push((spec, Some(aid)));
-                        }
-                    } else if old.cardinality != spec.cardinality
-                        || old.unique != spec.unique
-                        || old.is_component != spec.is_component
+                    // Unique attributes always keep their AVE entries, so the index flag is derived from both sides.
+                    let ave_old = old.index || old.unique.is_some();
+                    let ave_new = spec.index || spec.unique.is_some();
+                    if old.is_component != spec.is_component
                         || old.tuple_sources != spec.tuple_sources
-                        || old.index != spec.index && !spec.index
-                        || old.fulltext != spec.fulltext && !spec.fulltext
+                        || (ave_old && !ave_new && old.unique.is_none())
+                        || (old.fulltext && !spec.fulltext)
                     {
                         return Err(DatalogError::Schema(format!(
                             "cannot change the properties of existing attribute {}",
                             spec.name
                         )));
+                    }
+                    let single = old.cardinality == Cardinality::Many && spec.cardinality == Cardinality::One;
+                    let unique = old.unique.is_none() && spec.unique.is_some();
+                    if single || unique {
+                        checks.push((aid, spec.name.clone(), single, unique));
+                    }
+                    let mut stored = spec;
+                    // AVE stays maintained once it exists: dropping unique leaves its entries in place and keeps writing them.
+                    stored.index = ave_old || ave_new;
+                    if old.cardinality != stored.cardinality
+                        || old.unique != stored.unique
+                        || old.index != stored.index
+                        || old.fulltext != stored.fulltext
+                    {
+                        plan.push((stored, Some(aid)));
+                    }
+                }
+            }
+        }
+
+        // Validate before any write: a failed check leaves the store and in-memory schema unchanged.
+        if !checks.is_empty() {
+            let rtxn = self.read_txn()?;
+            let mut buf = Vec::new();
+            for (aid, name, single, unique) in &checks {
+                let mut eids = HashSet::new();
+                let mut vals = HashSet::new();
+                for item in self.eav.iter(&rtxn)? {
+                    let (k, _) = item?;
+                    if k.len() < 12 || u32::from_be_bytes(k[8..12].try_into().unwrap()) != *aid {
+                        continue;
+                    }
+                    let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                    if *single && !eids.insert(eid) {
+                        return Err(DatalogError::Schema(format!(
+                            "cannot change {name} to cardinality one: entity {eid} has more than one value"
+                        )));
+                    }
+                    if *unique {
+                        encode_av_prefix(*aid, &decode_value(&k[12..])?, &mut buf);
+                        if !vals.insert(buf.clone()) {
+                            return Err(DatalogError::Schema(format!(
+                                "cannot make {name} unique: duplicate value"
+                            )));
+                        }
                     }
                 }
             }
@@ -3348,15 +3394,19 @@ impl Conn {
                     aid
                 }
             };
-            if existing.is_some() {
-                for (eid, val, _) in self.scan_attr_rw(&wtxn, aid)? {
-                    if spec.index {
-                        encode_ave_key(aid, &val, eid, &mut ave_buf);
-                        self.ave.put(&mut wtxn, &ave_buf, &[])?;
-                    }
-                    if spec.fulltext {
-                        if let Some(text) = val.as_str() {
-                            self.fts.index_entry(&mut wtxn, &fts_key(eid, aid, &val), text)?;
+            if let Some(old) = self.attrs.get(&aid).filter(|_| existing.is_some()) {
+                let backfill_ave = spec.index && !(old.index || old.unique.is_some());
+                let backfill_ft = spec.fulltext && !old.fulltext;
+                if backfill_ave || backfill_ft {
+                    for (eid, val, _) in self.scan_attr_rw(&wtxn, aid)? {
+                        if backfill_ave {
+                            encode_ave_key(aid, &val, eid, &mut ave_buf);
+                            self.ave.put(&mut wtxn, &ave_buf, &[])?;
+                        }
+                        if backfill_ft {
+                            if let Some(text) = val.as_str() {
+                                self.fts.index_entry(&mut wtxn, &fts_key(eid, aid, &val), text)?;
+                            }
                         }
                     }
                 }

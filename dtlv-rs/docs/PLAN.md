@@ -69,7 +69,8 @@ Known limits to keep: rules with `or`, `not`, or nested queries still fall back 
   and `vec-neighbors` as a query function.
 - Idoc: array values inside patterns (today patterns may not contain arrays).
 - Transactions: `with` simulation and `:db/ensure`.
-- Schema: changing cardinality or uniqueness of an existing attribute in place.
+- Schema: changing cardinality or uniqueness in place is done (`update_schema`, validated against existing data;
+  tests `schema_change_test`). Attribute specs are not persisted, so callers must pass the new spec to `open`.
 - Durability: segmented txlog, automatic checkpoints and retention, env flags for no-sync writes, group commit.
 - Search: custom analyzers, doc filters and paging. Prefix and fuzzy terms are done (`[:prefix "s"]`,
   `[:fuzzy "s" d]`, d <= 2; matched against stemmed index terms; fuzzy scans the term dictionary).
