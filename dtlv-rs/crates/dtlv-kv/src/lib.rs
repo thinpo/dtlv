@@ -9,6 +9,7 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
+pub mod durable;
 pub mod list;
 pub use list::ListDb;
 
