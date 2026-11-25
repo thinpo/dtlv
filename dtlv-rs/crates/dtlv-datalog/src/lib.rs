@@ -1991,6 +1991,14 @@ impl Conn {
                 Some(lim) if lim >= 0 => rows.into_iter().skip(start).take(lim as usize).collect(),
                 _ => rows.into_iter().skip(start).collect(),
             };
+            // :keys shapes aggregate rows the same way as plain rows.
+            if let Some(keys) = &parsed.return_keys {
+                let maps = rows
+                    .into_iter()
+                    .map(|r| keys.iter().cloned().zip(r).collect::<BTreeMap<_, _>>())
+                    .collect();
+                return Ok(QueryResult::Maps(maps));
+            }
             return Ok(match parsed.find_spec {
                 FindSpec::Rel => QueryResult::Rel(rows),
                 FindSpec::Scalar => QueryResult::Scalar(rows.into_iter().next().and_then(|r| r.into_iter().next())),
@@ -2225,9 +2233,6 @@ impl Conn {
                 Clause::Datom(e_term, attr_name, v_term) => {
                     let aid = self.attr_id(attr_name)?;
                     let spec = &self.attrs[&aid];
-                    if spec.noindex && !matches!(v_term, ExprTerm::Var(_) | ExprTerm::Wildcard) {
-                        return Err(DatalogError::Type(format!("{attr_name} is :db/noindex; value conditions cannot use it")));
-                    }
                     // The unconstrained scan of this attribute is shared by every binding, so it runs at most once.
                     let mut attr_rows: Option<Vec<(EntityId, Value)>> = None;
                     let mut attr_hash: Option<HashMap<Vec<u8>, Vec<EntityId>>> = None;
@@ -2286,6 +2291,13 @@ impl Conn {
                                 }
                             }
                             (None, _) => {
+                                // Selecting entities by value needs the value index. A value that is only bound
+                                // here (a literal, an input, or an earlier clause's binding) cannot use it.
+                                if spec.noindex && bound_v.is_some() {
+                                    return Err(DatalogError::Type(format!(
+                                        "{attr_name} is :db/noindex; entities cannot be selected by its value"
+                                    )));
+                                }
                                 if attr_rows.is_none() {
                                     let mut rows = Vec::new();
                                     for item in self.eav.iter(rtxn)? {
