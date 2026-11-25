@@ -2230,6 +2230,7 @@ impl Conn {
                     }
                     // The unconstrained scan of this attribute is shared by every binding, so it runs at most once.
                     let mut attr_rows: Option<Vec<(EntityId, Value)>> = None;
+                    let mut attr_hash: Option<HashMap<Vec<u8>, Vec<EntityId>>> = None;
                     for env in &envs {
                         let bound_e: Option<EntityId> = match e_term {
                             ExprTerm::Val(v) => v.as_ref(),
@@ -2301,34 +2302,35 @@ impl Conn {
                                     }
                                     attr_rows = Some(rows);
                                 }
-                                for (eid, val) in attr_rows.as_deref().unwrap_or_default() {
-                                    let eid = *eid;
-                                    if let Some(bv) = bound_v {
-                                        if val != bv {
-                                            continue;
+                                if let Some(bv) = bound_v {
+                                    // Hash join on the bound value: index the attribute by value once per clause,
+                                    // then each binding probes the index instead of scanning the attribute.
+                                    if attr_hash.is_none() {
+                                        let mut map: HashMap<Vec<u8>, Vec<EntityId>> = HashMap::new();
+                                        for (eid, val) in attr_rows.as_deref().unwrap_or_default() {
+                                            let mut key = Vec::new();
+                                            encode_value(val, &mut key);
+                                            map.entry(key).or_default().push(*eid);
+                                        }
+                                        attr_hash = Some(map);
+                                    }
+                                    let mut key = Vec::new();
+                                    encode_value(bv, &mut key);
+                                    let eids: Vec<EntityId> = attr_hash
+                                        .as_ref()
+                                        .and_then(|m| m.get(&key).cloned())
+                                        .unwrap_or_default();
+                                    for eid in eids {
+                                        if let Some(e2) = bind_datom(env, e_term, v_term, eid, bv) {
+                                            next_envs.push(e2);
                                         }
                                     }
-                                    let val = val.clone();
-                                    let mut e2 = env.clone();
-                                    if let ExprTerm::Var(ename) = e_term {
-                                        if let Some(existing) = e2.get(ename) {
-                                            if existing != &Value::Ref(eid) {
-                                                continue;
-                                            }
-                                        } else {
-                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                } else {
+                                    for (eid, val) in attr_rows.as_deref().unwrap_or_default() {
+                                        if let Some(e2) = bind_datom(env, e_term, v_term, *eid, val) {
+                                            next_envs.push(e2);
                                         }
                                     }
-                                    if let ExprTerm::Var(vname) = v_term {
-                                        if let Some(existing) = e2.get(vname) {
-                                            if existing != &val {
-                                                continue;
-                                            }
-                                        } else {
-                                            e2.insert(vname.clone(), val.clone());
-                                        }
-                                    }
-                                    next_envs.push(e2);
                                 }
                             }
                         }
@@ -2588,6 +2590,31 @@ fn fts_key(eid: EntityId, aid: AttrId, val: &Value) -> Vec<u8> {
     key.extend_from_slice(&aid.to_be_bytes());
     encode_value(val, &mut key);
     key
+}
+
+/// Extends `env` with one matching datom `(eid, val)` for the pattern `[e_term a v_term]`, or `None` if the
+/// datom conflicts with a binding `env` already has.
+fn bind_datom(env: &HashMap<String, Value>, e_term: &ExprTerm, v_term: &ExprTerm, eid: EntityId, val: &Value) -> Option<HashMap<String, Value>> {
+    let mut e2 = env.clone();
+    if let ExprTerm::Var(ename) = e_term {
+        match e2.get(ename) {
+            Some(existing) if existing != &Value::Ref(eid) => return None,
+            Some(_) => {}
+            None => {
+                e2.insert(ename.clone(), Value::Ref(eid));
+            }
+        }
+    }
+    if let ExprTerm::Var(vname) = v_term {
+        match e2.get(vname) {
+            Some(existing) if existing != val => return None,
+            Some(_) => {}
+            None => {
+                e2.insert(vname.clone(), val.clone());
+            }
+        }
+    }
+    Some(e2)
 }
 
 /// Binds `var` to `val`, or checks equality if it is already bound. Returns false on conflict.

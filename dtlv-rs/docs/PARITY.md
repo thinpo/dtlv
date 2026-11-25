@@ -22,7 +22,7 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are semi-naive fixpoint (transitive closure over a 200-node chain: 4 s debug, was 522 s)) |
 | Query | cost-based ordering of datom clauses (greedy, index-aware), `explain` (access path and estimate per clause), `analyze` (rows and time per clause); an unconstrained attribute scan runs once per clause instead of once per binding | done |
 | Query | magic-set rewriting for rule calls with constant arguments (adorned rules and magic predicates; positive conjunctive bodies; other rules fall back to full evaluation). Applies to `q_str` and friends, not prepared queries. 300-node chain: 4 ms demand-driven vs 8 s full | done (limits noted) |
-| Query | hash joins (joins still nested-loop over cached rows) | todo |
+| Query | hash probe for datom patterns whose value is bound by an earlier clause but not indexed (index built once per clause). Other join shapes (both sides free, indexed lookups per binding) remain nested-loop | partial |
 | Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
 | Query | nested queries `[(q [:find ...] $ args...) [[?a ?b]]]` (positional binding, correlated per outer binding, constant ones run once; nested queries see the outer query's rules) | done |
 | Query | user functions in clauses, registered per connection with `register_query_fn` (resolved at evaluation) | done |
