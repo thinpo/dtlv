@@ -7,7 +7,7 @@ mod wal;
 
 pub use wal::{read_records as read_wal_records, Durability};
 
-pub use idoc::{apply_patch, idoc_get, idoc_value, pattern_predicates, PatchOp, PathSeg, JSON_NULL};
+pub use idoc::{apply_patch, idoc_get, idoc_value, idoc_value_edn, pattern_predicates, PatchOp, PathSeg, JSON_NULL};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;

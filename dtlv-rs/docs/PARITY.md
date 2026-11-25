@@ -50,7 +50,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Idoc | `idoc-match` clause in Datalog queries (`[(idoc-match $ :attr {...}) [[?e ?a ?v]]]`, literal or bound pattern values) | done |
 | Idoc | `:db.fn/patchIdoc` (set, unset, conj, merge, assoc, dissoc, inc, dec) on cardinality-one attributes, atomic with the transaction and logged to the WAL | done |
 | Idoc | `:db.fn/patchIdoc` on cardinality-many attributes (the old document identifies the target) | done |
-| Idoc | EDN/Markdown formats, domains and `indexed-paths`/`excluded-paths`, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
+| Idoc | EDN input (`idoc_value_edn`; keyword values, lists, and sets are rejected) | done |
+| Idoc | Markdown format, domains and `indexed-paths`/`excluded-paths`, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
 | Codecs | nippy, bits, zstd dictionary compression, CSV, Hu-Tucker keys, roaring | todo (in `datalevin/src/rust`) |
 
 ## Behavioral notes

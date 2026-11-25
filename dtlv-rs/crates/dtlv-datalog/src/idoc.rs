@@ -14,6 +14,7 @@ use dtlv_codec::{encode_escaped_bytes, encode_value, AttrId, EntityId, Value};
 use dtlv_kv::{ReadTxn, WriteTxn};
 use serde_json::Value as Json;
 
+use crate::parser::{parse_edn, Edn};
 use crate::{Conn, DatalogError};
 
 /// One step of a document path. `Index` addresses one array element.
@@ -397,4 +398,44 @@ pub fn apply_patch(doc_text: &str, ops: &[PatchOp]) -> Result<String, DatalogErr
         return Err(patch_err("the document root must stay an object or an array"));
     }
     serde_json::to_string(&doc).map_err(|e| patch_err(e.to_string()))
+}
+
+/// Parses EDN text (`:edn` idoc format) into the stored form. Keyword map keys lose their colon, so
+/// `{:status "active"}` is stored as `{"status": "active"}`. Keyword values, lists, and sets are rejected,
+/// since the stored form is JSON.
+pub fn idoc_value_edn(text: &str) -> Result<Value, DatalogError> {
+    fn convert(e: &Edn) -> Result<Json, DatalogError> {
+        Ok(match e {
+            Edn::Str(s) => Json::String(s.clone()),
+            Edn::Int(i) => Json::from(*i),
+            Edn::Float(f) => serde_json::Number::from_f64(*f)
+                .map(Json::Number)
+                .ok_or_else(|| DatalogError::Type("idoc EDN float must be finite".into()))?,
+            Edn::Bool(b) => Json::Bool(*b),
+            Edn::Vec(items) => Json::Array(items.iter().map(convert).collect::<Result<_, _>>()?),
+            Edn::Map(pairs) => {
+                let mut m = serde_json::Map::new();
+                for (k, v) in pairs {
+                    let key = match k {
+                        Edn::Keyword(k) => k.trim_start_matches(':').to_owned(),
+                        Edn::Str(s) => s.clone(),
+                        _ => return Err(DatalogError::Type("idoc map keys must be keywords or strings".into())),
+                    };
+                    m.insert(key, convert(v)?);
+                }
+                Json::Object(m)
+            }
+            Edn::Keyword(_) | Edn::Symbol(_) => {
+                return Err(DatalogError::Type("idoc EDN values cannot be keywords or symbols".into()))
+            }
+            Edn::List(_) => return Err(DatalogError::Type("idoc does not allow lists".into())),
+        })
+    }
+    let edn = parse_edn(text).map_err(|e| DatalogError::Type(format!("invalid idoc EDN: {e}")))?;
+    if !matches!(edn, Edn::Map(_) | Edn::Vec(_)) {
+        return Err(DatalogError::Type("idoc root must be a map or a vector".into()));
+    }
+    let json = convert(&edn)?;
+    let canonical = serde_json::to_string(&json).map_err(|e| DatalogError::Type(e.to_string()))?;
+    Ok(Value::Doc(canonical))
 }
