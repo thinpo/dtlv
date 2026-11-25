@@ -129,6 +129,23 @@ fn index_key(aid: AttrId, path: &[Seg], val: &Value, eid: EntityId) -> Vec<u8> {
     key
 }
 
+/// Whether a selector addresses a leaf path. A selector without positions matches across array elements,
+/// so its keys are compared against the leaf's keys with array indices removed.
+fn selector_matches(sel: &[PathSeg], leaf: &[Seg]) -> bool {
+    let has_index = sel.iter().any(|s| matches!(s, PathSeg::Index(_)));
+    let leaf: Vec<Seg> = if has_index {
+        leaf.to_vec()
+    } else {
+        leaf.iter().filter(|s| !matches!(s, Seg::Idx(_))).cloned().collect()
+    };
+    sel.len() <= leaf.len()
+        && sel.iter().zip(&leaf).all(|(p, l)| match (p, l) {
+            (PathSeg::Key(a), Seg::Key(b)) => a == b,
+            (PathSeg::Index(a), Seg::Idx(b)) => a == b,
+            _ => false,
+        })
+}
+
 /// Walks a document along `path`. Returns the subvalue, or `None` if the path is absent.
 pub fn idoc_get(doc_text: &str, path: &[PathSeg]) -> Option<Json> {
     let mut cur: Json = serde_json::from_str(doc_text).ok()?;
@@ -192,8 +209,15 @@ impl Conn {
         let doc: Json = serde_json::from_str(doc_text).map_err(|e| DatalogError::Type(e.to_string()))?;
         let mut leaves = Vec::new();
         collect_leaves(&doc, &mut Vec::new(), &mut leaves);
+        let spec = self.attrs.get(&aid);
+        let indexed = spec.and_then(|s| s.indexed_paths.as_deref());
+        let excluded: &[Vec<PathSeg>] = spec.map(|s| s.excluded_paths.as_slice()).unwrap_or(&[]);
         let mut keys = Vec::new();
         for (segs, val) in &leaves {
+            let in_scope = indexed.is_none_or(|sels| sels.iter().any(|sel| selector_matches(sel, segs)));
+            if !in_scope || excluded.iter().any(|sel| selector_matches(sel, segs)) {
+                continue;
+            }
             for form in path_forms(segs) {
                 keys.push(index_key(aid, &form, val, eid));
             }

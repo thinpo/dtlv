@@ -49,6 +49,10 @@ pub struct AttrSpec {
     pub tuple_sources: Option<Vec<String>>,
     /// Indexed-document attribute: values must be `Value::Doc` and are path-indexed.
     pub idoc: bool,
+    /// Idoc path selectors to index. `None` indexes every path.
+    pub indexed_paths: Option<Vec<Vec<PathSeg>>>,
+    /// Idoc path selectors to omit. Excluded paths win over indexed ones.
+    pub excluded_paths: Vec<Vec<PathSeg>>,
 }
 
 impl AttrSpec {
@@ -62,12 +66,26 @@ impl AttrSpec {
             is_component: false,
             tuple_sources: None,
             idoc: false,
+            indexed_paths: None,
+            excluded_paths: Vec::new(),
         }
     }
 
     /// Declares an indexed-document attribute (see `idoc_value` for the accepted input).
     pub fn idoc(mut self) -> Self {
         self.idoc = true;
+        self
+    }
+
+    /// Restricts idoc indexing to paths under these selectors (`:db.idoc/indexedPaths`).
+    pub fn idoc_indexed_paths(mut self, paths: Vec<Vec<PathSeg>>) -> Self {
+        self.indexed_paths = Some(paths);
+        self
+    }
+
+    /// Omits paths under these selectors from idoc indexing (`:db.idoc/excludedPaths`).
+    pub fn idoc_excluded_paths(mut self, paths: Vec<Vec<PathSeg>>) -> Self {
+        self.excluded_paths = paths;
         self
     }
 
