@@ -28,7 +28,6 @@ pub enum PathSeg {
 enum Seg {
     Key(String),
     Idx(u32),
-    Any,
 }
 
 /// JSON null is indexed as the keyword `:json/null`, as in Datalevin.
@@ -90,27 +89,45 @@ fn encode_path(segs: &[Seg]) -> Vec<u8> {
                 out.push(0x02);
                 out.extend_from_slice(&i.to_be_bytes());
             }
-            Seg::Any => out.push(0x03),
+
         }
     }
     out
 }
 
 /// The three indexed forms of one leaf path, without duplicates.
+/// Array levels beyond this are indexed only at the two extremes (all indices kept, all dropped).
+const MAX_INDEXED_ARRAY_LEVELS: usize = 6;
+
+/// The indexed forms of one leaf path. Each array index on the path is either kept (a query can name that
+/// position) or dropped (a query can match any element there), so a query with any mix of named and free
+/// positions finds the leaf. There are 2^d forms for d array levels.
 fn path_forms(segs: &[Seg]) -> Vec<Vec<Seg>> {
-    let concrete = segs.to_vec();
-    let collapsed: Vec<Seg> = segs.iter().filter(|s| !matches!(s, Seg::Idx(_))).cloned().collect();
-    let wildcard: Vec<Seg> = segs
+    let positions: Vec<usize> = segs
         .iter()
-        .map(|s| if let Seg::Idx(_) = s { Seg::Any } else { s.clone() })
+        .enumerate()
+        .filter_map(|(i, s)| matches!(s, Seg::Idx(_)).then_some(i))
         .collect();
-    let mut out = vec![concrete];
-    for form in [collapsed, wildcard] {
-        if !out.contains(&form) {
-            out.push(form);
-        }
+    if positions.len() > MAX_INDEXED_ARRAY_LEVELS {
+        let all_kept = segs.to_vec();
+        let all_dropped: Vec<Seg> = segs.iter().filter(|s| !matches!(s, Seg::Idx(_))).cloned().collect();
+        return vec![all_kept, all_dropped];
     }
-    out
+    (0..1usize << positions.len())
+        .map(|mask| {
+            let drop: Vec<usize> = positions
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) == 0)
+                .map(|(_, &pos)| pos)
+                .collect();
+            segs.iter()
+                .enumerate()
+                .filter(|(i, _)| !drop.contains(i))
+                .map(|(_, s)| s.clone())
+                .collect()
+        })
+        .collect()
 }
 
 /// Prefix for `(aid, path, value)`; the eid suffix follows.
@@ -287,11 +304,9 @@ impl Conn {
         for (aid, name) in targets {
             let mut matched: Option<BTreeSet<EntityId>> = None;
             for (path, val) in preds {
-                // Concrete form when the predicate names indices, collapsed form otherwise.
-                let mut segs = to_segs(path);
-                if !segs.iter().any(|s| matches!(s, Seg::Idx(_))) {
-                    segs.retain(|s| !matches!(s, Seg::Idx(_)));
-                }
+                // The predicate's path as written: named positions are kept, and array levels it leaves unnamed
+                // were indexed with those positions dropped.
+                let segs = to_segs(path);
                 let prefix = lookup_prefix(aid, &segs, val);
                 let mut eids = BTreeSet::new();
                 for item in self.idoc_idx.prefix_iter(rtxn, &prefix)? {
