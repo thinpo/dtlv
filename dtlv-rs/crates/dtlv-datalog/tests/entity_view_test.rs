@@ -58,3 +58,22 @@ fn lookup_for_unknown_value_is_none() {
     let rtxn = c.read_txn().unwrap();
     assert!(c.entity_by_lookup(&rtxn, ":p/name", &s("Nobody")).unwrap().is_none());
 }
+
+#[test]
+fn assoc_and_dissoc_build_transaction_items() {
+    let c = conn();
+    let e = {
+        let rtxn = c.read_txn().unwrap();
+        c.lookup_entity_by_av(&rtxn, ":p/name", &s("Ann")).unwrap().unwrap()
+    };
+    let rtxn = c.read_txn().unwrap();
+    let ent = c.entity(&rtxn, e);
+    let set = ent.assoc(":p/age", Value::I64(31));
+    let unset = ent.dissoc(":p/tag");
+    drop(rtxn);
+    c.transact(&[set, unset]).unwrap();
+    let rtxn = c.read_txn().unwrap();
+    let ent = c.entity(&rtxn, e);
+    assert_eq!(ent.get(":p/age").unwrap(), Some(Value::I64(31)));
+    assert_eq!(ent.get(":p/tag").unwrap(), None);
+}

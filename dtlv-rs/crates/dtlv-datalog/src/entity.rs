@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use dtlv_codec::{EntityId, Value};
 use dtlv_kv::ReadTxn;
 
-use crate::{Conn, DatalogError};
+use crate::{Conn, DatalogError, TxItem};
 
 pub struct Entity<'a, 'r> {
     conn: &'a Conn,
@@ -62,5 +62,17 @@ impl Conn {
         val: &Value,
     ) -> Result<Option<Entity<'a, 'r>>, DatalogError> {
         Ok(self.lookup_entity_by_av(rtxn, attr, val)?.map(|eid| Entity { conn: self, rtxn, eid }))
+    }
+}
+
+impl<'a, 'r> Entity<'a, 'r> {
+    /// Transaction item that sets `attr` on this entity. For cardinality-one attributes it replaces the value.
+    pub fn assoc(&self, attr: &str, val: Value) -> TxItem {
+        TxItem::Assert(Some(self.eid), vec![(attr.to_owned(), val)])
+    }
+
+    /// Transaction item that removes every value of `attr` from this entity.
+    pub fn dissoc(&self, attr: &str) -> TxItem {
+        TxItem::RetractAttribute(self.eid, attr.to_owned())
     }
 }
