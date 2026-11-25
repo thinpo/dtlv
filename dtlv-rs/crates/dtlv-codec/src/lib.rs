@@ -241,7 +241,15 @@ pub fn encode_eav_key(e: EntityId, a: AttrId, val: &Value, out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(&e.to_be_bytes());
     out.extend_from_slice(&a.to_be_bytes());
-    encode_value(val, out);
+    encode_value_indexed(val, out);
+}
+
+/// AEV key: [a: 4B][e: 8B][encoded_value...]
+pub fn encode_aev_key(a: AttrId, e: EntityId, val: &Value, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&a.to_be_bytes());
+    out.extend_from_slice(&e.to_be_bytes());
+    encode_value_indexed(val, out);
 }
 
 pub fn encode_ea_prefix(e: EntityId, a: AttrId, out: &mut Vec<u8>) {
@@ -252,10 +260,19 @@ pub fn encode_ea_prefix(e: EntityId, a: AttrId, out: &mut Vec<u8>) {
 
 /// AVE prefix: [a: 4B][escaped(encoded_value)]
 /// Encoding for index keys. `-0.0` and `0.0` are equal values, so both are keyed as `0.0`; otherwise a lookup
-/// for one misses the other. The stored value itself is not changed (see `encode_value`).
+/// for one misses the other.
 pub fn encode_value_indexed(val: &Value, out: &mut Vec<u8>) {
     match val {
         Value::F64(x) if *x == 0.0 => encode_value(&Value::F64(0.0), out),
+        Value::Tuple(elems) => {
+            out.push(val.tag());
+            let mut tmp = Vec::with_capacity(32);
+            for el in elems {
+                tmp.clear();
+                encode_value_indexed(el, &mut tmp);
+                encode_escaped_bytes(&tmp, out);
+            }
+        }
         other => encode_value(other, out),
     }
 }

@@ -16,8 +16,8 @@ pub use idoc::{apply_patch, idoc_get, idoc_value, idoc_value_edn, idoc_value_mar
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use dtlv_codec::{
-    decode_ave_entity, decode_value, encode_av_prefix, encode_ave_key, encode_ea_prefix, encode_value,
-    encode_eav_key, encode_vae_key, AttrId, CodecError, EntityId, Value,
+    decode_ave_entity, decode_value, encode_aev_key, encode_av_prefix, encode_ave_key, encode_ea_prefix,
+    encode_eav_key, encode_vae_key, encode_value, AttrId, CodecError, EntityId, Value,
 };
 use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
 use dtlv_search::{FullTextIndex, FtsConfig, Metric, VectorIndex};
@@ -382,6 +382,7 @@ const APPLIED_LSN_KEY: &[u8] = b"__applied_lsn";
 pub struct Conn {
     store: KvStore,
     eav: RawDb,
+    aev: RawDb,
     ave: RawDb,
     vae: RawDb,
     meta: RawDb,
@@ -405,7 +406,7 @@ pub struct Conn {
 impl Conn {
     /// Open or create an LMDB-backed Datalog connection at `path`.
     pub fn open<P: AsRef<Path>>(path: P, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
-        let store = KvStore::open(path, 512 * 1024 * 1024, 16)?;
+        let store = KvStore::open(path, 512 * 1024 * 1024, 32)?;
         Self::init_from_store(store, schema)
     }
 
@@ -429,6 +430,7 @@ impl Conn {
     fn init_from_store(store: KvStore, schema: Vec<AttrSpec>) -> Result<Self, DatalogError> {
         let mut wtxn = store.write_txn()?;
         let eav = store.open_db(&mut wtxn, "eav")?;
+        let aev = store.open_db(&mut wtxn, "aev")?;
         let ave = store.open_db(&mut wtxn, "ave")?;
         let vae = store.open_db(&mut wtxn, "vae")?;
         let meta = store.open_db(&mut wtxn, "meta")?;
@@ -479,6 +481,22 @@ impl Conn {
             attrs.insert(aid, spec);
         }
         meta.put(&mut wtxn, NEXT_AID_KEY, &next_aid.to_be_bytes())?;
+        if aev.iter_rw(&wtxn)?.is_empty() {
+            let mut rows = Vec::new();
+            for (k, _) in eav.iter_rw(&wtxn)? {
+                if k.len() >= 12 {
+                    let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                    let aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
+                    let val = decode_value(&k[12..])?;
+                    rows.push((aid, eid, val));
+                }
+            }
+            let mut aev_buf = Vec::with_capacity(64);
+            for (aid, eid, val) in rows {
+                encode_aev_key(aid, eid, &val, &mut aev_buf);
+                aev.put(&mut wtxn, &aev_buf, &[])?;
+            }
+        }
         wtxn.commit()?;
 
         for (name, &aid) in &attr_ids {
@@ -511,6 +529,7 @@ impl Conn {
         Ok(Self {
             store,
             eav,
+            aev,
             ave,
             vae,
             meta,
@@ -564,6 +583,7 @@ impl Conn {
         for (dbi_name, s_db) in [
             ("meta", &self.meta),
             ("eav", &self.eav),
+            ("aev", &self.aev),
             ("ave", &self.ave),
             ("vae", &self.vae),
         ] {
@@ -600,6 +620,7 @@ impl Conn {
         for (src_db, dst_db) in [
             (&src.meta, &dst.meta),
             (&src.eav, &dst.eav),
+            (&src.aev, &dst.aev),
             (&src.ave, &dst.ave),
             (&src.vae, &dst.vae),
         ] {
@@ -1041,6 +1062,8 @@ impl Conn {
         for old_eav in existing {
             let old_val = decode_value(&old_eav[12..])?;
             self.eav.delete(wtxn, &old_eav)?;
+            encode_aev_key(aid, eid, &old_val, ave_buf);
+            self.aev.delete(wtxn, ave_buf)?;
             if let (true, Value::Doc(text)) = (spec.idoc, &old_val) {
                 self.idoc_del(wtxn, aid, eid, text)?;
             }
@@ -1084,6 +1107,8 @@ impl Conn {
             let val = Value::Ref(eid);
             encode_eav_key(src, aid, &val, ave_buf);
             self.eav.delete(wtxn, ave_buf)?;
+            encode_aev_key(aid, src, &val, ave_buf);
+            self.aev.delete(wtxn, ave_buf)?;
             changes.push(TxDatum { eid: src, attr: self.aid_names[&aid].clone(), value: val.clone(), added: false });
             if let Some(spec) = self.attrs.get(&aid) {
                 if spec.index {
@@ -1106,6 +1131,8 @@ impl Conn {
             let aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
             let val = decode_value(&k[12..])?;
             self.eav.delete(wtxn, &k)?;
+            encode_aev_key(aid, eid, &val, ave_buf);
+            self.aev.delete(wtxn, ave_buf)?;
             changes.push(TxDatum { eid, attr: self.aid_names[&aid].clone(), value: val.clone(), added: false });
             if let Some(spec) = self.attrs.get(&aid) {
                 if let (true, Value::Doc(text)) = (spec.idoc, &val) {
@@ -1170,7 +1197,11 @@ impl Conn {
             // The record is in the log but the store did not commit it: mark it aborted so replay skips it.
             if let (Some(lsn), Some(guard)) = (logged_lsn, wal_guard.as_mut()) {
                 if let Some(wal) = guard.as_mut() {
-                    let _ = wal.append_abort(lsn);
+                    if let Err(abort_err) = wal.append_abort(lsn) {
+                        return Err(DatalogError::Wal(format!(
+                            "store commit failed ({e}); failed to append WAL abort for lsn {lsn}: {abort_err}"
+                        )));
+                    }
                 }
             }
             return Err(e.into());
@@ -1354,21 +1385,23 @@ impl Conn {
                 let spec = &self.attrs[&aid];
                 encode_eav_key(*eid, aid, val, &mut st.eav_buf);
                 if self.eav.delete(wtxn, &st.eav_buf)? {
+                    encode_aev_key(aid, *eid, val, &mut st.ave_buf);
+                    self.aev.delete(wtxn, &st.ave_buf)?;
                     st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: val.clone(), added: false });
                     if let (true, Value::Doc(text)) = (spec.idoc, val) {
                         self.idoc_del(wtxn, aid, *eid, text)?;
                     }
-                }
-                if spec.index {
-                    encode_ave_key(aid, val, *eid, &mut st.ave_buf);
-                    self.ave.delete(wtxn, &st.ave_buf)?;
-                }
-                if let Value::Ref(target) = val {
-                    encode_vae_key(*target, aid, *eid, &mut st.ave_buf);
-                    self.vae.delete(wtxn, &st.ave_buf)?;
-                }
-                if spec.fulltext {
-                    self.fts.remove_entry(wtxn, &fts_key(*eid, aid, val))?;
+                    if spec.index {
+                        encode_ave_key(aid, val, *eid, &mut st.ave_buf);
+                        self.ave.delete(wtxn, &st.ave_buf)?;
+                    }
+                    if let Value::Ref(target) = val {
+                        encode_vae_key(*target, aid, *eid, &mut st.ave_buf);
+                        self.vae.delete(wtxn, &st.ave_buf)?;
+                    }
+                    if spec.fulltext {
+                        self.fts.remove_entry(wtxn, &fts_key(*eid, aid, val))?;
+                    }
                 }
                 st.touched.push(*eid);
             }
@@ -1427,6 +1460,8 @@ impl Conn {
                 let patched = Value::Doc(apply_patch(old_text, ops)?);
                 // Retract the old document (and its index entries), then assert the patched one.
                 self.eav.delete(wtxn, &key)?;
+                encode_aev_key(aid, *eid, old, &mut st.ave_buf);
+                self.aev.delete(wtxn, &st.ave_buf)?;
                 if self.attrs[&aid].index {
                     encode_ave_key(aid, old, *eid, &mut st.ave_buf);
                     self.ave.delete(wtxn, &st.ave_buf)?;
@@ -1590,6 +1625,8 @@ impl Conn {
 
         encode_eav_key(eid, aid, val, eav_buf);
         self.eav.put(wtxn, eav_buf, &[])?;
+        encode_aev_key(aid, eid, val, ave_buf);
+        self.aev.put(wtxn, ave_buf, &[])?;
         changes.push(TxDatum { eid, attr: attr_name.to_owned(), value: val.clone(), added: true });
         if let (true, Value::Doc(text)) = (spec.idoc, val) {
             self.idoc_put(wtxn, aid, eid, text)?;
@@ -1690,9 +1727,11 @@ impl Conn {
 
                         match (bound_e, bound_v) {
                             (Some(eid), Some(val)) => {
-                                encode_eav_key(eid, aid, val, &mut buf);
-                                if self.eav.get(rtxn, &buf)?.is_some() {
-                                    next_envs.push(env.clone());
+                                if !contains_nan(val) {
+                                    encode_eav_key(eid, aid, val, &mut buf);
+                                    if self.eav.get(rtxn, &buf)?.is_some() {
+                                        next_envs.push(env.clone());
+                                    }
                                 }
                             }
                             (Some(eid), None) => {
@@ -1708,35 +1747,33 @@ impl Conn {
                                 }
                             }
                             (None, Some(val)) if spec.index => {
-                                encode_av_prefix(aid, val, &mut buf);
-                                for item in self.ave.prefix_iter(rtxn, &buf)? {
-                                    let (k, _) = item?;
-                                    let eid = decode_ave_entity(&k)?;
-                                    let mut e2 = env.clone();
-                                    if let Term::Var(ename) = e_term {
-                                        if let Some(existing) = e2.get(ename) {
-                                            if existing != &Value::Ref(eid) {
-                                                continue;
+                                if !contains_nan(val) {
+                                    encode_av_prefix(aid, val, &mut buf);
+                                    for item in self.ave.prefix_iter(rtxn, &buf)? {
+                                        let (k, _) = item?;
+                                        let eid = decode_ave_entity(&k)?;
+                                        let mut e2 = env.clone();
+                                        if let Term::Var(ename) = e_term {
+                                            if let Some(existing) = e2.get(ename) {
+                                                if existing != &Value::Ref(eid) {
+                                                    continue;
+                                                }
+                                            } else {
+                                                e2.insert(ename.clone(), Value::Ref(eid));
                                             }
-                                        } else {
-                                            e2.insert(ename.clone(), Value::Ref(eid));
                                         }
+                                        next_envs.push(e2);
                                     }
-                                    next_envs.push(e2);
                                 }
                             }
                             (None, _) => {
-                                // Full EAV scan filtered by aid
-                                for item in self.eav.iter(rtxn)? {
+                                // Attribute scan via AEV
+                                for item in self.aev.prefix_iter(rtxn, &aid.to_be_bytes())? {
                                     let (k, _) = item?;
                                     if k.len() < 12 {
                                         continue;
                                     }
-                                    let k_aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
-                                    if k_aid != aid {
-                                        continue;
-                                    }
-                                    let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                                    let eid = u64::from_be_bytes(k[4..12].try_into().unwrap());
                                     let val = decode_value(&k[12..])?;
                                     if let Some(bv) = bound_v {
                                         if &val != bv {
@@ -1943,13 +1980,7 @@ impl Conn {
                 .filter(|env| {
                     let key = proj
                         .iter()
-                        .map(|v| {
-                            env.get(*v).map(|val| {
-                                let mut buf = Vec::new();
-                                dtlv_codec::encode_value_indexed(val, &mut buf);
-                                buf
-                            })
-                        })
+                        .map(|v| env.get(*v).map(encoded_value_key))
                         .collect();
                     seen.insert(key)
                 })
@@ -2042,18 +2073,18 @@ impl Conn {
             Some(lim) if lim >= 0 => Some(lim as usize),
             _ => None,
         };
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<Vec<Option<Vec<u8>>>> = HashSet::new();
         let mut envs_slice: Vec<HashMap<String, Value>> = Vec::new();
         for env in envs {
-            let key: Vec<Option<&Value>> = parsed
+            let key: Vec<Option<Vec<u8>>> = parsed
                 .find
                 .iter()
                 .map(|elem| match elem {
-                    FindElem::Var(v) | FindElem::Pull(v, _) => env.get(v),
+                    FindElem::Var(v) | FindElem::Pull(v, _) => env.get(v).map(encoded_value_key),
                     FindElem::Agg(_, _) => None,
                 })
                 .collect();
-            if !seen.insert(format!("{:?}", key)) {
+            if !seen.insert(key) {
                 continue;
             }
             if seen.len() <= start {
@@ -2131,7 +2162,7 @@ impl Conn {
         // call reading the delta, so each round only produces tuples that use something new.
         let delta_key = |n: &str| format!("\u{1}delta:{n}");
         let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
-        let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut seen: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
         for name in rule_map.keys() {
             tables.insert(name.clone(), Vec::new());
             tables.insert(delta_key(name), Vec::new());
@@ -2194,7 +2225,7 @@ impl Conn {
                                     }
                                 }
                             }
-                            if ok && seen.get_mut(name).unwrap().insert(format!("{:?}", tuple)) {
+                            if ok && seen.get_mut(name).unwrap().insert(encoded_values_key(&tuple)) {
                                 produced.entry(name.clone()).or_default().push(tuple);
                             }
                         }
@@ -2252,9 +2283,11 @@ impl Conn {
                         };
                         match (bound_e, bound_v) {
                             (Some(eid), Some(val)) => {
-                                encode_eav_key(eid, aid, val, &mut buf);
-                                if self.eav.get(rtxn, &buf)?.is_some() {
-                                    next_envs.push(env.clone());
+                                if !contains_nan(val) {
+                                    encode_eav_key(eid, aid, val, &mut buf);
+                                    if self.eav.get(rtxn, &buf)?.is_some() {
+                                        next_envs.push(env.clone());
+                                    }
                                 }
                             }
                             (Some(eid), None) => {
@@ -2283,27 +2316,29 @@ impl Conn {
                                 }
                             }
                             (None, Some(val)) if spec.index => {
-                                encode_av_prefix(aid, val, &mut buf);
-                                if !ave_memo.contains_key(buf.as_slice()) {
-                                    let mut eids = Vec::new();
-                                    for item in self.ave.prefix_iter(rtxn, &buf)? {
-                                        let (k, _) = item?;
-                                        eids.push(decode_ave_entity(&k)?);
-                                    }
-                                    ave_memo.insert(buf.clone(), eids);
-                                }
-                                for &eid in &ave_memo[buf.as_slice()] {
-                                    let mut e2 = env.clone();
-                                    if let ExprTerm::Var(ename) = e_term {
-                                        if let Some(existing) = e2.get(ename) {
-                                            if existing != &Value::Ref(eid) {
-                                                continue;
-                                            }
-                                        } else {
-                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                if !contains_nan(val) {
+                                    encode_av_prefix(aid, val, &mut buf);
+                                    if !ave_memo.contains_key(buf.as_slice()) {
+                                        let mut eids = Vec::new();
+                                        for item in self.ave.prefix_iter(rtxn, &buf)? {
+                                            let (k, _) = item?;
+                                            eids.push(decode_ave_entity(&k)?);
                                         }
+                                        ave_memo.insert(buf.clone(), eids);
                                     }
-                                    next_envs.push(e2);
+                                    for &eid in &ave_memo[buf.as_slice()] {
+                                        let mut e2 = env.clone();
+                                        if let ExprTerm::Var(ename) = e_term {
+                                            if let Some(existing) = e2.get(ename) {
+                                                if existing != &Value::Ref(eid) {
+                                                    continue;
+                                                }
+                                            } else {
+                                                e2.insert(ename.clone(), Value::Ref(eid));
+                                            }
+                                        }
+                                        next_envs.push(e2);
+                                    }
                                 }
                             }
                             (None, _) => {
@@ -2316,16 +2351,12 @@ impl Conn {
                                 }
                                 if attr_rows.is_none() {
                                     let mut rows = Vec::new();
-                                    for item in self.eav.iter(rtxn)? {
+                                    for item in self.aev.prefix_iter(rtxn, &aid.to_be_bytes())? {
                                         let (k, _) = item?;
                                         if k.len() < 12 {
                                             continue;
                                         }
-                                        let k_aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
-                                        if k_aid != aid {
-                                            continue;
-                                        }
-                                        let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                                        let eid = u64::from_be_bytes(k[4..12].try_into().unwrap());
                                         rows.push((eid, decode_value(&k[12..])?));
                                     }
                                     attr_rows = Some(rows);
@@ -2634,17 +2665,38 @@ fn fts_key(eid: EntityId, aid: AttrId, val: &Value) -> Vec<u8> {
     key
 }
 
-/// Hash key for a value under `Value` equality. `-0.0` and `0.0` are equal, so they share a key; `NaN` equals
-/// nothing, so it has none.
-fn probe_key(v: &Value) -> Option<Vec<u8>> {
-    let canonical = match v {
-        Value::F64(x) if x.is_nan() => return None,
-        Value::F64(x) if *x == 0.0 => Value::F64(0.0),
-        other => other.clone(),
-    };
+fn encoded_value_key(v: &Value) -> Vec<u8> {
     let mut key = Vec::new();
-    encode_value(&canonical, &mut key);
-    Some(key)
+    dtlv_codec::encode_value_indexed(v, &mut key);
+    key
+}
+
+fn encoded_values_key(vals: &[Value]) -> Vec<u8> {
+    let mut key = Vec::new();
+    let mut elem = Vec::new();
+    for v in vals {
+        elem.clear();
+        dtlv_codec::encode_value_indexed(v, &mut elem);
+        dtlv_codec::encode_escaped_bytes(&elem, &mut key);
+    }
+    key
+}
+
+fn contains_nan(v: &Value) -> bool {
+    match v {
+        Value::F64(x) => x.is_nan(),
+        Value::Tuple(elems) => elems.iter().any(contains_nan),
+        _ => false,
+    }
+}
+
+/// Hash key for a value under `Value` equality. `-0.0` and `0.0` are equal (even inside tuples),
+/// so they share a key; `NaN` equals nothing, so any value containing `NaN` has no key.
+fn probe_key(v: &Value) -> Option<Vec<u8>> {
+    if contains_nan(v) {
+        return None;
+    }
+    Some(encoded_value_key(v))
 }
 
 /// Extends `env` with one matching datom `(eid, val)` for the pattern `[e_term a v_term]`, or `None` if the
@@ -3180,10 +3232,14 @@ impl Conn {
         aid: AttrId,
     ) -> Result<Vec<(EntityId, Value, Vec<u8>)>, DatalogError> {
         let mut out = Vec::new();
-        for (k, _) in self.eav.iter_rw(wtxn)? {
-            if k.len() >= 12 && u32::from_be_bytes(k[8..12].try_into().unwrap()) == aid {
-                let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
-                out.push((eid, decode_value(&k[12..])?, k));
+        let mut eav_buf = Vec::new();
+        for res in self.aev.prefix_iter_rw(wtxn, &aid.to_be_bytes())? {
+            let (k, _) = res?;
+            if k.len() >= 12 {
+                let eid = u64::from_be_bytes(k[4..12].try_into().unwrap());
+                let val = decode_value(&k[12..])?;
+                encode_eav_key(eid, aid, &val, &mut eav_buf);
+                out.push((eid, val, eav_buf.clone()));
             }
         }
         Ok(out)
@@ -3268,6 +3324,8 @@ impl Conn {
             let spec = self.attrs.get(&aid).cloned();
             for (eid, val, key) in self.scan_attr_rw(&wtxn, aid)? {
                 self.eav.delete(&mut wtxn, &key)?;
+                encode_aev_key(aid, eid, &val, &mut ave_buf);
+                self.aev.delete(&mut wtxn, &ave_buf)?;
                 if spec.as_ref().is_some_and(|s| s.index) {
                     encode_ave_key(aid, &val, eid, &mut ave_buf);
                     self.ave.delete(&mut wtxn, &ave_buf)?;
@@ -3381,8 +3439,8 @@ fn aggregate_envs(
         })
         .collect();
 
-    let mut groups: BTreeMap<String, Vec<&HashMap<String, Value>>> = BTreeMap::new();
-    let mut group_keys_vals: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut groups: BTreeMap<Vec<u8>, Vec<&HashMap<String, Value>>> = BTreeMap::new();
+    let mut group_keys_vals: HashMap<Vec<u8>, Vec<Value>> = HashMap::new();
 
     for env in envs {
         let mut gvals = Vec::with_capacity(group_vars.len());
@@ -3393,7 +3451,7 @@ fn aggregate_envs(
                 .clone();
             gvals.push(v);
         }
-        let gkey = format!("{:?}", gvals);
+        let gkey = encoded_values_key(&gvals);
         group_keys_vals.entry(gkey.clone()).or_insert(gvals);
         groups.entry(gkey).or_default().push(env);
     }
@@ -3899,5 +3957,16 @@ mod wal_abort_tests {
         assert!(has("kept"));
         assert!(has("after"));
         assert!(!has("lost"), "aborted transaction was replayed after restart");
+    }
+
+    #[test]
+    fn a_failed_wal_abort_after_failed_commit_returns_wal_error() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        FAIL_NEXT_COMMIT.with(|c| c.set(true));
+        wal::FAIL_NEXT_ABORT.with(|c| c.set(true));
+        let err = conn.transact(&[name("lost")]);
+        assert!(matches!(err, Err(DatalogError::Wal(_))), "got {err:?}");
     }
 }

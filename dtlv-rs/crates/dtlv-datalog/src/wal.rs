@@ -467,6 +467,10 @@ impl Wal {
 
     /// Marks transaction `lsn` as not committed to the store, so replay skips it.
     pub fn append_abort(&mut self, lsn: u64) -> Result<(), crate::DatalogError> {
+        #[cfg(test)]
+        if FAIL_NEXT_ABORT.with(|c| c.replace(false)) {
+            return Err(crate::DatalogError::Wal("injected wal abort failure".into()));
+        }
         let mut payload = Vec::with_capacity(12);
         payload.extend_from_slice(&lsn.to_be_bytes());
         payload.extend_from_slice(&ABORT_COUNT.to_be_bytes());
@@ -503,6 +507,11 @@ pub fn read_records(path: &Path) -> Result<Vec<(u64, Vec<TxItem>)>, crate::Datal
         .and_then(|mut f| f.read_to_end(&mut bytes))
         .map_err(|e| crate::DatalogError::Wal(e.to_string()))?;
     Ok(committed(&parse(&bytes).0))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_ABORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
