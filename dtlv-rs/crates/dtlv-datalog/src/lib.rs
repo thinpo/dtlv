@@ -1690,8 +1690,7 @@ impl Conn {
 
                         match (bound_e, bound_v) {
                             (Some(eid), Some(val)) => {
-                                encode_eav_key(eid, aid, val, &mut buf);
-                                if self.eav.get(rtxn, &buf)?.is_some() {
+                                if self.eav_has(rtxn, eid, aid, val, &mut buf)? {
                                     next_envs.push(env.clone());
                                 }
                             }
@@ -1707,7 +1706,7 @@ impl Conn {
                                     next_envs.push(e2);
                                 }
                             }
-                            (None, Some(val)) if spec.index => {
+                            (None, Some(val)) if spec.index && probe_key(val).is_some() => {
                                 encode_av_prefix(aid, val, &mut buf);
                                 for item in self.ave.prefix_iter(rtxn, &buf)? {
                                     let (k, _) = item?;
@@ -2219,6 +2218,29 @@ impl Conn {
         Ok(tables)
     }
 
+    /// Whether entity `eid` holds `val` for `aid`. NaN equals nothing. Datoms keep the sign of zero as written, so a
+    /// zero lookup checks both signs.
+    fn eav_has(&self, rtxn: &ReadTxn<'_>, eid: EntityId, aid: AttrId, val: &Value, buf: &mut Vec<u8>) -> Result<bool, DatalogError> {
+        if probe_key(val).is_none() {
+            return Ok(false);
+        }
+        let zeros: &[f64] = match val {
+            Value::F64(x) if *x == 0.0 => &[0.0, -0.0],
+            _ => &[],
+        };
+        if zeros.is_empty() {
+            encode_eav_key(eid, aid, val, buf);
+            return Ok(self.eav.get(rtxn, buf)?.is_some());
+        }
+        for &z in zeros {
+            encode_eav_key(eid, aid, &Value::F64(z), buf);
+            if self.eav.get(rtxn, buf)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn eval_clauses(
         &self,
         rtxn: &ReadTxn<'_>,
@@ -2252,8 +2274,7 @@ impl Conn {
                         };
                         match (bound_e, bound_v) {
                             (Some(eid), Some(val)) => {
-                                encode_eav_key(eid, aid, val, &mut buf);
-                                if self.eav.get(rtxn, &buf)?.is_some() {
+                                if self.eav_has(rtxn, eid, aid, val, &mut buf)? {
                                     next_envs.push(env.clone());
                                 }
                             }
@@ -2282,7 +2303,7 @@ impl Conn {
                                     next_envs.push(e2);
                                 }
                             }
-                            (None, Some(val)) if spec.index => {
+                            (None, Some(val)) if spec.index && probe_key(val).is_some() => {
                                 encode_av_prefix(aid, val, &mut buf);
                                 if !ave_memo.contains_key(buf.as_slice()) {
                                     let mut eids = Vec::new();

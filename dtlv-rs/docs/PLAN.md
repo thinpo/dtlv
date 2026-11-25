@@ -16,11 +16,12 @@ neither bound (attribute scan, shared once per clause, then a nested loop over b
 
 Open shapes:
 
-- **Neither side bound, shared variables with the bindings.** Example: `[?a :l/x ?v] [?b :r/x ?v]` where `?v` is bound
-  only by the first clause and the second clause's value is free. Plan: a general hash join. Build a table over the
-  clause's rows keyed by the values of the variables the clause shares with the bindings (for a datom: `e`, `v`, or
-  both), then probe it once per binding. Equality uses the canonical key from `probe_key` (zero and NaN as already
-  handled). Shapes with no shared variable stay a cross product, which is the correct semantics.
+- **Shared value, unindexed: done.** The hash probe over the attribute's rows (`probe_key`) already covers this, as
+  does the per-clause memo for indexed attributes. Correctness against the nested-loop oracle is now tested in
+  `join_shapes_test`: duplicates on both sides, zero and NaN, three clauses, no shared variable, empty sides.
+- **Shared entity or value, via a general hash join over the clause's own rows.** Not built. The existing shapes
+  cover every datom pattern with a bound entity or bound value, so this is only needed if a case shows up that falls
+  through to a nested loop (none found).
 - **Indexed lookup per binding: partly done.** Index scans are now memoized per clause by their bound key (entity or
   encoded value), so bindings that share a key share one scan. `indexed_lookup_test` checks correctness and a cost
   bound; the memo's own saving is not isolated by those tests (result building dominates at that size).
@@ -73,10 +74,13 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
 
 - **Float equality in attribute-value indexes: fixed.** AVE keys and idoc path keys now encode zero as `+0.0`
   (`encode_value_indexed`), and the aggregate dedupe key does too. Tests: `float_index_test`.
-- **Float equality in EAV point lookups: open decision.** Datoms store the sign of zero as written, so an entity that
-  holds `-0.0` does not match a `0.0` point lookup on that entity (`(Some(e), Some(v))` in `eval_clauses`), and
-  asserting `0.0` on it adds a second datom. Value equality says these are the same. Options: canonicalize zero in
-  EAV keys too (reading back returns `0.0`), or keep the distinction and document it. Decide before 1.1.
+- **Float equality in EAV point lookups: decided, query side fixed.** Datoms keep the sign of zero as written
+  (no key-format change, so existing databases stay valid). Point lookups (`eav_has`) now check both signs of zero,
+  so a `0.0` lookup finds an entity that holds `-0.0`. NaN equals nothing in EAV point lookups, AVE scans, and the
+  hash probe. Before this, the indexed AVE scan matched NaN to NaN while the hash probe did not, so the same join
+  gave different answers by index. Tests: `join_shapes_test`. Still open: asserting `0.0` on an entity that holds
+  `-0.0` adds a second datom, because writes keep the sign. Canonicalizing zero on write would fix that, but it
+  changes stored keys and needs a migration for existing databases, so it is left for a decision.
 - **Live WAL abort path: tested.** A test-only switch makes the next store commit fail after its log record is
   appended. The test checks the failed transaction is invisible, the log holds an abort marker, the connection keeps
   working, and the aborted record is not replayed after restart (`wal_abort_tests` in `lib.rs`).
@@ -85,8 +89,9 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
 
 ## 3. Order of work
 
-1. Decide the EAV zero question (section 2). The AVE part is done.
-2. Join shapes (1.1), tests first. This is the largest remaining optimizer item.
+1. EAV zero question (section 2): decided and fixed on the query side. Write-side canonicalization is still open.
+2. Join shapes (1.1): oracle tests and the NaN/zero fixes are in. Remaining: the probe-count cost guard
+   (asserting `d` index scans for `d` distinct keys needs a counter; not added).
 3. Magic sets on prepared queries (1.2).
 5. Smaller items in 1.3, by value to users.
 
