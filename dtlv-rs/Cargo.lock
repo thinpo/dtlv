@@ -122,6 +122,7 @@ dependencies = [
  "dtlv-kv",
  "dtlv-search",
  "heed",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

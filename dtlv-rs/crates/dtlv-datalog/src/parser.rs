@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use dtlv_codec::Value;
+use dtlv_search::Query as FtsQuery;
+
+use crate::PathSeg;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -273,11 +276,21 @@ pub struct OrderSpec {
     pub desc: bool,
 }
 
+/// Full-text query argument: a literal query tree, or a variable bound to a string at run time.
+#[derive(Debug, Clone)]
+pub enum FtsArg {
+    Static(FtsQuery),
+    Var(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum Clause {
     Datom(ExprTerm, String, ExprTerm),
     Pred(CmpOp, ExprTerm, ExprTerm),
-    Fulltext(ExprTerm, String), // (query_term, entity_var)
+    Fulltext(FtsArg, String), // (query, entity_var)
+    /// `[(idoc-match $ [:attr] {pattern}) [[?e ?a ?v]]]`: attribute (or all idoc attributes), predicates,
+    /// and the `?e ?a ?v` output variables (`None` for `_`).
+    IdocMatch(Option<String>, Vec<(Vec<PathSeg>, ExprTerm)>, [Option<String>; 3]),
     Or(Vec<Vec<Clause>>),
     /// `(or-join [?join ...] branch ...)`: branches may bind only the join vars into the outer scope.
     OrJoin(Vec<String>, Vec<Vec<Clause>>),
@@ -339,6 +352,85 @@ fn edn_to_term(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Exp
         }
         other => Err(ParseError::InvalidQuery(format!("unexpected term: {:?}", other))),
     }
+}
+
+/// Converts a full-text query literal: a string, `{:phrase "..."}`, `{:term "..."}`, or `[:and|:or|:not ...]`.
+fn edn_to_fts(edn: &Edn) -> Result<FtsQuery, ParseError> {
+    match edn {
+        Edn::Str(s) => Ok(FtsQuery::Text(s.clone())),
+        Edn::Map(pairs) if pairs.len() == 1 => match (&pairs[0].0, &pairs[0].1) {
+            (Edn::Keyword(k), Edn::Str(s)) if k == ":phrase" => Ok(FtsQuery::Phrase(s.clone())),
+            (Edn::Keyword(k), Edn::Str(s)) if k == ":term" => Ok(FtsQuery::Term(s.clone())),
+            _ => Err(ParseError::InvalidQuery("full-text map must be {:phrase \"...\"} or {:term \"...\"}".into())),
+        },
+        Edn::Vec(items) if !items.is_empty() => {
+            let op = match &items[0] {
+                Edn::Keyword(k) => k.as_str(),
+                _ => return Err(ParseError::InvalidQuery("full-text vector must start with :and, :or, or :not".into())),
+            };
+            let children = items[1..].iter().map(edn_to_fts).collect::<Result<Vec<_>, _>>()?;
+            match op {
+                ":and" => Ok(FtsQuery::And(children)),
+                ":or" => Ok(FtsQuery::Or(children)),
+                ":not" if children.len() == 1 => Ok(FtsQuery::Not(Box::new(children.into_iter().next().unwrap()))),
+                _ => Err(ParseError::InvalidQuery(format!("unknown full-text operator {op}"))),
+            }
+        }
+        other => Err(ParseError::InvalidQuery(format!("invalid full-text query: {other:?}"))),
+    }
+}
+
+/// `[(idoc-match $ [:attr] {pattern}) [[?e ?a ?v]]]`.
+fn parse_idoc_match(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String, Value>>) -> Result<Clause, ParseError> {
+    let args: Vec<&Edn> = inner[1..].iter().filter(|e| !matches!(e, Edn::Symbol(s) if s == "$")).collect();
+    let (attr, pattern) = match args.as_slice() {
+        [pattern] => (None, *pattern),
+        [Edn::Keyword(a), pattern] => (Some(a.clone()), *pattern),
+        _ => return Err(ParseError::InvalidQuery("idoc-match takes an optional attribute and a pattern".into())),
+    };
+    fn walk(p: &Edn, path: &mut Vec<PathSeg>, out: &mut Vec<(Vec<PathSeg>, ExprTerm)>, in_map: Option<&HashMap<String, Value>>) -> Result<(), ParseError> {
+        match p {
+            Edn::Map(pairs) => {
+                for (k, v) in pairs {
+                    let seg = match k {
+                        Edn::Keyword(k) => PathSeg::Key(k.trim_start_matches(':').to_owned()),
+                        Edn::Str(s) => PathSeg::Key(s.clone()),
+                        Edn::Int(i) => PathSeg::Index(*i as u32),
+                        _ => return Err(ParseError::InvalidQuery("idoc pattern keys must be keywords or strings".into())),
+                    };
+                    path.push(seg);
+                    walk(v, path, out, in_map)?;
+                    path.pop();
+                }
+                Ok(())
+            }
+            scalar => {
+                out.push((path.clone(), edn_to_term(scalar, in_map)?));
+                Ok(())
+            }
+        }
+    }
+    let mut preds = Vec::new();
+    walk(pattern, &mut Vec::new(), &mut preds, in_map)?;
+
+    let out_vars = match items.get(1) {
+        Some(Edn::Vec(rows)) if rows.len() == 1 => match &rows[0] {
+            Edn::Vec(cols) if cols.len() == 3 => {
+                let mut vars = [None, None, None];
+                for (i, c) in cols.iter().enumerate() {
+                    vars[i] = match c {
+                        Edn::Symbol(s) if s == "_" => None,
+                        Edn::Symbol(s) if s.starts_with('?') => Some(s.clone()),
+                        _ => return Err(ParseError::InvalidQuery("idoc-match output must be ?vars or _".into())),
+                    };
+                }
+                vars
+            }
+            _ => return Err(ParseError::InvalidQuery("idoc-match output must be [[?e ?a ?v]]".into())),
+        },
+        _ => return Err(ParseError::InvalidQuery("idoc-match output must be [[?e ?a ?v]]".into())),
+    };
+    Ok(Clause::IdocMatch(attr, preds, out_vars))
 }
 
 /// Function-call clause: `(f args...)` with an optional output binding item.
@@ -435,12 +527,23 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                     return Err(ParseError::InvalidQuery("empty expression list".into()));
                 }
                 if let Edn::Symbol(op) = &inner[0] {
+                    if op == "idoc-match" {
+                        return parse_idoc_match(inner, items, in_map);
+                    }
                     if op == "fulltext" {
                         // [(fulltext $ ?q) [[?e _ ?name]]] or [(fulltext $ ?q) ?e]
                         if inner.len() < 3 || items.len() < 2 {
                             return Err(ParseError::InvalidQuery("invalid fulltext clause".into()));
                         }
-                        let q_term = edn_to_term(&inner[2], in_map)?;
+                        let q_arg = match &inner[2] {
+                            Edn::Symbol(s) if s.starts_with('?') => match in_map.and_then(|m| m.get(s)) {
+                                Some(v) => FtsArg::Static(FtsQuery::Text(
+                                    v.as_str().unwrap_or_default().to_owned(),
+                                )),
+                                None => FtsArg::Var(s.clone()),
+                            },
+                            other => FtsArg::Static(edn_to_fts(other)?),
+                        };
                         let e_var = match &items[1] {
                             Edn::Symbol(s) if s.starts_with('?') => s.clone(),
                             Edn::Vec(outer) => {
@@ -457,7 +560,7 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                             }
                             _ => return Err(ParseError::InvalidQuery("invalid fulltext binding".into())),
                         };
-                        return Ok(Clause::Fulltext(q_term, e_var));
+                        return Ok(Clause::Fulltext(q_arg, e_var));
                     }
 
                     let cmp = match op.as_str() {

@@ -9,6 +9,7 @@ dtlv-kv = { path = "../dtlv-kv" }
 dtlv-search = { path = "../dtlv-search" }
 heed.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

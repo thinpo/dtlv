@@ -1,5 +1,10 @@
 pub mod fulltext;
+pub mod hnsw;
 pub mod stem;
+
+use std::sync::Mutex;
+
+use hnsw::Hnsw;
 
 pub use fulltext::{analyze, tokenize, FtsConfig, FullTextIndex, Query};
 
@@ -13,16 +18,37 @@ pub enum Metric {
     DotProduct,
 }
 
+/// Indexes at or below this size are searched exactly; larger ones use the HNSW graph.
+pub const BRUTE_FORCE_MAX: u64 = 512;
+/// Beam width for graph search (raised to `k` when `k` is larger).
+const EF_SEARCH: usize = 64;
+const VERSION_KEY: &[u8] = b"version";
+
 /// LMDB-persisted vector index for entity embeddings (entity resolution & semantic lookup).
+///
+/// Vectors live in LMDB. Searches over more than `BRUTE_FORCE_MAX` vectors use an in-memory HNSW graph,
+/// which is rebuilt whenever the persisted version counter differs from the one it was built at. This
+/// keeps results consistent with aborts and older read snapshots. The cost is one rebuild after writes.
 pub struct VectorIndex {
     vectors: RawDb,
+    meta: RawDb,
     metric: Metric,
+    graph: Mutex<Option<(u64, Hnsw)>>,
 }
 
 impl VectorIndex {
     pub fn open(store: &KvStore, wtxn: &mut WriteTxn<'_>, name: &str, metric: Metric) -> Result<Self, KvError> {
         let vectors = store.open_db(wtxn, name)?;
-        Ok(Self { vectors, metric })
+        let meta = store.open_db(wtxn, &format!("{name}__meta"))?;
+        Ok(Self { vectors, meta, metric, graph: Mutex::new(None) })
+    }
+
+    fn bump_version(&self, wtxn: &mut WriteTxn<'_>) -> Result<(), KvError> {
+        let cur = match self.meta.get_rw(wtxn, VERSION_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 0,
+        };
+        self.meta.put(wtxn, VERSION_KEY, &(cur + 1).to_be_bytes())
     }
 
     pub fn add_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, vec: &[f32]) -> Result<(), KvError> {
@@ -31,12 +57,12 @@ impl VectorIndex {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
         self.vectors.put(wtxn, &eid.to_be_bytes(), &bytes)?;
-        Ok(())
+        self.bump_version(wtxn)
     }
 
     pub fn remove_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
         self.vectors.delete(wtxn, &eid.to_be_bytes())?;
-        Ok(())
+        self.bump_version(wtxn)
     }
 
     pub fn dump_vecs(&self, rtxn: &ReadTxn<'_>) -> Result<Vec<(EntityId, Vec<f32>)>, KvError> {
@@ -56,7 +82,8 @@ impl VectorIndex {
         Ok(out)
     }
 
-    /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer) using bounded O(k) memory.
+    /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer).
+    /// Exact for small indexes; approximate (HNSW) above `BRUTE_FORCE_MAX` vectors.
     pub fn search_vec(
         &self,
         rtxn: &ReadTxn<'_>,
@@ -66,6 +93,24 @@ impl VectorIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if self.vectors.len(rtxn)? <= BRUTE_FORCE_MAX {
+            return self.search_exact(rtxn, query, k);
+        }
+        let version = match self.meta.get(rtxn, VERSION_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 0,
+        };
+        let mut guard = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().map(|(v, _)| *v) != Some(version) {
+            let items = self.dump_vecs(rtxn)?;
+            *guard = Some((version, Hnsw::build(self.metric, items)));
+        }
+        let graph = &guard.as_ref().expect("graph built above").1;
+        Ok(graph.search(query, k, EF_SEARCH).into_iter().collect())
+    }
+
+    /// Exact top-k by scanning every vector, with bounded O(k) memory.
+    fn search_exact(&self, rtxn: &ReadTxn<'_>, query: &[f32], k: usize) -> Result<Vec<(EntityId, f32)>, KvError> {
         #[derive(Clone, Copy)]
         struct Hit(f32, EntityId);
         impl PartialEq for Hit {

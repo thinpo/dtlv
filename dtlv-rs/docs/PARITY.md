@@ -31,14 +31,20 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | KV | get/put/delete/range/prefix/iter on LMDB, SQLite, redb, memory | done |
 | KV | list (dupsort) DBIs (`ListDb`), rank, by-rank, range count, first-n, clear | done |
 | KV | drop/copy/stat/list-dbis, sample, buffers; list ops not yet exposed via `Conn` | todo |
-| Durability | WAL, txlog, snapshots, GC, watermarks, durability profiles, tx-group, async tx | todo |
+| Durability | Datalog write-ahead log (`Conn::open_wal`): framed and checksummed, replay of unapplied records, torn-tail recovery, `checkpoint`, strict and relaxed profiles | done |
+| Durability | KV-level WAL, segmented txlog, snapshots, GC, watermarks, env flags for no-sync writes, tx-group, async tx | todo |
+| Durability | a failed store commit after a log append is marked aborted, and replay skips it (replay path tested; the live failure path is not) | done |
 | Search | BM25 with Datalevin's default analyzer (stopwords on, positions kept across gaps) | done |
 | Search | English Snowball (Porter2) stemming, `FtsConfig` (fixed before indexing) | done |
 | Search | boolean `and` / `or` / `not` and positional `phrase` queries (`Query`, `Conn::fulltext_query`) | done |
-| Search | fuzzy and prefix terms, custom analyzers, EDN query syntax in Datalog `fulltext` clause, doc-filter, paging | todo |
-| Vector | exact top-k over 3 metrics | done |
-| Vector | ANN index (usearch HNSW), quantization, checkpoints, `vec-neighbors` in query | todo |
-| Idoc | document values, `idoc-match`, `idoc-get`, patch, path index | todo (only the `Doc` tag exists) |
+| Search | `fulltext` clause accepts `:and`/`:or`/`:not`, `{:phrase}`, `{:term}`, and bound string variables | done |
+| Search | fuzzy and prefix terms, custom analyzers, doc-filter, paging | todo |
+| Vector | exact top-k over 3 metrics (used below 512 vectors) | done |
+| Vector | in-memory HNSW for indexes above 512 vectors, rebuilt after writes (version-checked) | done |
+| Vector | incremental graph maintenance, persisted graph, quantization, checkpoints, `vec-neighbors` in query | todo |
+| Idoc | JSON documents, path index (concrete, collapsed, wildcard forms), `idoc_match` (conjunctive), `idoc_get` | done (JSON, sync indexing) |
+| Idoc | `idoc-match` clause in Datalog queries (`[(idoc-match $ :attr {...}) [[?e ?a ?v]]]`, literal or bound pattern values) | done |
+| Idoc | EDN/Markdown formats, domains and `indexed-paths`/`excluded-paths`, `:db.fn/patchIdoc`, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
 | Codecs | nippy, bits, zstd dictionary compression, CSV, Hu-Tucker keys, roaring | todo (in `datalevin/src/rust`) |
 
 ## Behavioral notes

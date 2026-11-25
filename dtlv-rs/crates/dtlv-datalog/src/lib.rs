@@ -1,4 +1,10 @@
 pub mod parser;
+mod idoc;
+mod wal;
+
+pub use wal::{read_records as read_wal_records, Durability};
+
+pub use idoc::{idoc_get, idoc_value, pattern_predicates, PathSeg, JSON_NULL};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -38,6 +44,8 @@ pub struct AttrSpec {
     pub is_component: bool,
     /// Source attribute names when this is a composite tuple (`:db/tupleAttrs`).
     pub tuple_sources: Option<Vec<String>>,
+    /// Indexed-document attribute: values must be `Value::Doc` and are path-indexed.
+    pub idoc: bool,
 }
 
 impl AttrSpec {
@@ -50,7 +58,14 @@ impl AttrSpec {
             fulltext: false,
             is_component: false,
             tuple_sources: None,
+            idoc: false,
         }
+    }
+
+    /// Declares an indexed-document attribute (see `idoc_value` for the accepted input).
+    pub fn idoc(mut self) -> Self {
+        self.idoc = true;
+        self
     }
 
     /// Declares a composite tuple attribute over cardinality-one source attributes.
@@ -120,6 +135,10 @@ pub enum DatalogError {
     TupleWrite(String),
     #[error("unknown transaction function: {0}")]
     UnknownTxFn(String),
+    #[error("type error: {0}")]
+    Type(String),
+    #[error("write-ahead log error: {0}")]
+    Wal(String),
 }
 
 /// Removes the given suffixed variants of a SQLite path (e.g. `""`, `"-wal"`, `"-shm"`);
@@ -168,6 +187,7 @@ pub enum TxVal {
     LookupRef(String, Value),
 }
 
+#[derive(Debug, Clone)]
 pub enum TxItem {
     /// Assert a map of (attr_name, Value) pairs. If `:db/id` is omitted, allocates or upserts.
     Assert(Option<EntityId>, Vec<(String, Value)>),
@@ -221,6 +241,8 @@ pub struct TxReport {
 
 #[derive(Default)]
 struct TxState {
+    /// Items as applied (calls expanded), kept only when a WAL is attached.
+    logged: Option<Vec<TxItem>>,
     changes: Vec<TxDatum>,
     touched: Vec<EntityId>,
     tempids: HashMap<String, EntityId>,
@@ -281,6 +303,7 @@ pub struct Query {
 
 const NEXT_EID_KEY: &[u8] = b"__next_eid";
 const NEXT_AID_KEY: &[u8] = b"__next_aid";
+const APPLIED_LSN_KEY: &[u8] = b"__applied_lsn";
 
 pub struct Conn {
     store: KvStore,
@@ -297,6 +320,8 @@ pub struct Conn {
     tuple_specs: Vec<(String, AttrId, Vec<AttrId>)>,
     tuple_targets: HashSet<AttrId>,
     tx_fns: HashMap<String, TxFn>,
+    idoc_idx: RawDb,
+    wal: std::sync::Mutex<Option<wal::Wal>>,
     listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
 }
 
@@ -330,6 +355,7 @@ impl Conn {
         let ave = store.open_db(&mut wtxn, "ave")?;
         let vae = store.open_db(&mut wtxn, "vae")?;
         let meta = store.open_db(&mut wtxn, "meta")?;
+        let idoc_idx = store.open_db(&mut wtxn, "idoc_paths")?;
         let fts = FullTextIndex::open(&store, &mut wtxn)?;
         let vec_idx = VectorIndex::open(&store, &mut wtxn, "vec_idx", Metric::Cosine)?;
 
@@ -418,6 +444,8 @@ impl Conn {
             tuple_specs,
             tuple_targets,
             tx_fns: HashMap::new(),
+            idoc_idx,
+            wal: std::sync::Mutex::new(None),
             listeners: Vec::new(),
         })
     }
@@ -932,6 +960,9 @@ impl Conn {
         for old_eav in existing {
             let old_val = decode_value(&old_eav[12..])?;
             self.eav.delete(wtxn, &old_eav)?;
+            if let (true, Value::Doc(text)) = (spec.idoc, &old_val) {
+                self.idoc_del(wtxn, aid, eid, text)?;
+            }
             changes.push(TxDatum { eid, attr: spec.name.clone(), value: old_val.clone(), added: false });
             if spec.index {
                 encode_ave_key(aid, &old_val, eid, ave_buf);
@@ -994,6 +1025,9 @@ impl Conn {
             self.eav.delete(wtxn, &k)?;
             changes.push(TxDatum { eid, attr: self.aid_names[&aid].clone(), value: val.clone(), added: false });
             if let Some(spec) = self.attrs.get(&aid) {
+                if let (true, Value::Doc(text)) = (spec.idoc, &val) {
+                    self.idoc_del(wtxn, aid, eid, text)?;
+                }
                 if spec.index {
                     encode_ave_key(aid, &val, eid, ave_buf);
                     self.ave.delete(wtxn, ave_buf)?;
@@ -1022,13 +1056,45 @@ impl Conn {
     }
 
     pub fn transact(&self, items: &[TxItem]) -> Result<Vec<EntityId>, DatalogError> {
+        self.run_tx(items, None)
+    }
+
+    /// Applies one transaction. Live writes are logged to the WAL (when attached) before the LMDB commit;
+    /// replayed writes (`replay: Some(lsn)`) are not logged again and record `lsn` as applied.
+    fn run_tx(&self, items: &[TxItem], replay: Option<u64>) -> Result<Vec<EntityId>, DatalogError> {
+        let mut wal_guard = if replay.is_none() {
+            Some(self.wal.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        let logging = wal_guard.as_ref().is_some_and(|g| g.is_some());
         let mut wtxn = self.store.write_txn()?;
-        let mut st = TxState::default();
+        let mut st = TxState { logged: logging.then(Vec::new), ..TxState::default() };
         for item in items {
             self.apply_item(&mut wtxn, item, &mut st)?;
         }
         self.recompute_tuples(&mut wtxn, &st.touched, &mut st.changes)?;
-        wtxn.commit()?;
+        let mut logged_lsn = None;
+        if let Some(lsn) = replay {
+            self.set_applied_lsn(&mut wtxn, lsn)?;
+        } else if let (Some(guard), Some(logged)) = (wal_guard.as_mut(), st.logged.as_deref()) {
+            if let Some(wal) = guard.as_mut() {
+                if !logged.is_empty() {
+                    let lsn = wal.append(logged)?;
+                    self.set_applied_lsn(&mut wtxn, lsn)?;
+                    logged_lsn = Some(lsn);
+                }
+            }
+        }
+        if let Err(e) = wtxn.commit() {
+            // The record is in the log but the store did not commit it: mark it aborted so replay skips it.
+            if let (Some(lsn), Some(guard)) = (logged_lsn, wal_guard.as_mut()) {
+                if let Some(wal) = guard.as_mut() {
+                    let _ = wal.append_abort(lsn);
+                }
+            }
+            return Err(e.into());
+        }
         if !st.changes.is_empty() && !self.listeners.is_empty() {
             let report = TxReport { tx_data: std::mem::take(&mut st.changes) };
             for (_, f) in &self.listeners {
@@ -1036,6 +1102,57 @@ impl Conn {
             }
         }
         Ok(st.touched)
+    }
+
+    fn set_applied_lsn(&self, wtxn: &mut WriteTxn<'_>, lsn: u64) -> Result<(), DatalogError> {
+        self.meta.put(wtxn, APPLIED_LSN_KEY, &lsn.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Last WAL record applied to the store (0 if none).
+    pub fn applied_lsn(&self) -> Result<u64, DatalogError> {
+        let rtxn = self.store.read_txn()?;
+        Ok(match self.meta.get(&rtxn, APPLIED_LSN_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 0,
+        })
+    }
+
+    /// Opens a connection with a write-ahead log in directory `dir`. Records the store has not applied are
+    /// replayed before the connection is returned, so a crash after a log append loses nothing.
+    pub fn open_wal<P: AsRef<Path>, Q: AsRef<Path>>(
+        path: P,
+        dir: Q,
+        schema: Vec<AttrSpec>,
+        durability: Durability,
+    ) -> Result<Self, DatalogError> {
+        let conn = Self::open(path, schema)?;
+        let applied = conn.applied_lsn()?;
+        let (log, records) = wal::Wal::open(&dir.as_ref().join("wal.log"), durability, applied)?;
+        for (lsn, items) in records {
+            if lsn > applied {
+                conn.run_tx(&items, Some(lsn))?;
+            }
+        }
+        *conn.wal.lock().unwrap_or_else(|e| e.into_inner()) = Some(log);
+        Ok(conn)
+    }
+
+    /// Forces logged transactions to disk. Only meaningful for the relaxed profile.
+    pub fn sync_wal(&self) -> Result<(), DatalogError> {
+        if let Some(log) = self.wal.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Makes the store durable, then drops the log, which is no longer needed for recovery.
+    pub fn checkpoint(&self) -> Result<(), DatalogError> {
+        if let Some(log) = self.wal.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            self.store.sync()?;
+            log.truncate()?;
+        }
+        Ok(())
     }
 
     fn reject_tuple_writes<'n>(&self, names: impl IntoIterator<Item = &'n str>) -> Result<(), DatalogError> {
@@ -1050,6 +1167,11 @@ impl Conn {
     }
 
     fn apply_item(&self, wtxn: &mut WriteTxn<'_>, item: &TxItem, st: &mut TxState) -> Result<(), DatalogError> {
+        if let Some(log) = st.logged.as_mut() {
+            if !matches!(item, TxItem::Call(..)) {
+                log.push(item.clone());
+            }
+        }
         match item {
             TxItem::Assert(explicit_eid, pairs) => {
                 self.reject_tuple_writes(pairs.iter().map(|(a, _)| a.as_str()))?;
@@ -1153,6 +1275,9 @@ impl Conn {
                 encode_eav_key(*eid, aid, val, &mut st.eav_buf);
                 if self.eav.delete(wtxn, &st.eav_buf)? {
                     st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: val.clone(), added: false });
+                    if let (true, Value::Doc(text)) = (spec.idoc, val) {
+                        self.idoc_del(wtxn, aid, *eid, text)?;
+                    }
                 }
                 if spec.index {
                     encode_ave_key(aid, val, *eid, &mut st.ave_buf);
@@ -1302,6 +1427,9 @@ impl Conn {
     ) -> Result<(), DatalogError> {
         let aid = self.attr_id(attr_name)?;
         let spec = &self.attrs[&aid];
+        if spec.idoc && !matches!(val, Value::Doc(_)) {
+            return Err(DatalogError::Type(format!("{attr_name} is an idoc attribute; use idoc_value")));
+        }
 
         if let Some(u) = spec.unique {
             if let Some(existing) = self.lookup_ave_rw(wtxn, aid, val, ave_buf)? {
@@ -1321,6 +1449,9 @@ impl Conn {
         encode_eav_key(eid, aid, val, eav_buf);
         self.eav.put(wtxn, eav_buf, &[])?;
         changes.push(TxDatum { eid, attr: attr_name.to_owned(), value: val.clone(), added: true });
+        if let (true, Value::Doc(text)) = (spec.idoc, val) {
+            self.idoc_put(wtxn, aid, eid, text)?;
+        }
 
         if spec.index {
             encode_ave_key(aid, val, eid, ave_buf);
@@ -1862,24 +1993,45 @@ impl Conn {
                         }
                     }
                 }
-                Clause::Fulltext(q_term, e_var) => {
+                Clause::Fulltext(arg, e_var) => {
                     for env in &envs {
-                        let q_val = match q_term {
-                            ExprTerm::Val(v) => v.as_str().map(|s| s.to_owned()),
-                            ExprTerm::Var(v) => env.get(v).and_then(|val| val.as_str().map(|s| s.to_owned())),
-                            ExprTerm::Wildcard => None,
+                        let query = match arg {
+                            parser::FtsArg::Static(q) => q.clone(),
+                            parser::FtsArg::Var(v) => match env.get(v).and_then(|val| val.as_str()) {
+                                Some(text) => FtsQuery::Text(text.to_owned()),
+                                None => continue,
+                            },
                         };
-                        if let Some(q_str) = q_val {
-                            let hits = self.fts.search(rtxn, &q_str, 100)?;
-                            for &(eid, _) in &hits {
-                                let mut e2 = env.clone();
-                                if let Some(bound) = e2.get(e_var) {
-                                    if bound != &Value::Ref(eid) {
-                                        continue;
-                                    }
-                                } else {
-                                    e2.insert(e_var.clone(), Value::Ref(eid));
-                                }
+                        let hits = self.fts.search_query(rtxn, &query, 100)?;
+                        for &(eid, _) in &hits {
+                            let mut e2 = env.clone();
+                            if bind_var(&mut e2, e_var, Value::Ref(eid)) {
+                                next_envs.push(e2);
+                            }
+                        }
+                    }
+                }
+                Clause::IdocMatch(attr, preds, out) => {
+                    for env in &envs {
+                        let mut resolved = Vec::with_capacity(preds.len());
+                        for (path, term) in preds {
+                            match resolve_term(env, term) {
+                                Some(v) => resolved.push((path.clone(), v.clone())),
+                                None => return Err(DatalogError::UnboundVar(format!("{term:?}"))),
+                            }
+                        }
+                        for (eid, name, doc) in self.idoc_match(rtxn, attr.as_deref(), &resolved)? {
+                            let mut e2 = env.clone();
+                            let bindings = [
+                                (out[0].as_ref(), Value::Ref(eid)),
+                                (out[1].as_ref(), Value::Keyword(name.clone())),
+                                (out[2].as_ref(), doc),
+                            ];
+                            let ok = bindings.into_iter().all(|(var, val)| match var {
+                                Some(v) => bind_var(&mut e2, v, val),
+                                None => true,
+                            });
+                            if ok {
                                 next_envs.push(e2);
                             }
                         }
