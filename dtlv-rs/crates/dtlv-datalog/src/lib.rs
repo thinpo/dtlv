@@ -1362,8 +1362,19 @@ impl Conn {
                 let aid = self.attr_id(attr_name)?;
                 let spec = &self.attrs[&aid];
                 encode_eav_key(*eid, aid, val, &mut st.eav_buf);
-                if self.eav.delete(wtxn, &st.eav_buf)? {
-                    st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: val.clone(), added: false });
+                let mut stored = if self.eav.delete(wtxn, &st.eav_buf)? { Some(val.clone()) } else { None };
+                // Legacy datoms may hold the other sign of zero.
+                if let (None, Value::F64(x)) = (&stored, val) {
+                    if *x == 0.0 {
+                        let other = Value::F64(-*x);
+                        encode_eav_key(*eid, aid, &other, &mut st.eav_buf);
+                        if self.eav.delete(wtxn, &st.eav_buf)? {
+                            stored = Some(other);
+                        }
+                    }
+                }
+                if let Some(stored) = stored {
+                    st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: stored, added: false });
                     if let (true, Value::Doc(text)) = (spec.idoc, val) {
                         self.idoc_del(wtxn, aid, *eid, text)?;
                     }
@@ -1579,6 +1590,18 @@ impl Conn {
         if spec.idoc && !matches!(val, Value::Doc(_)) {
             return Err(DatalogError::Type(format!("{attr_name} is an idoc attribute; use idoc_value")));
         }
+        // Written zeros are stored as +0.0. A legacy -0.0 on a many-valued attribute is replaced, not duplicated.
+        let canon_zero;
+        let val = if matches!(val, Value::F64(x) if *x == 0.0) {
+            canon_zero = Value::F64(0.0);
+            if spec.cardinality == Cardinality::Many {
+                encode_eav_key(eid, aid, &Value::F64(-0.0), eav_buf);
+                self.eav.delete(wtxn, eav_buf)?;
+            }
+            &canon_zero
+        } else {
+            val
+        };
 
         if spec.unique.is_some() {
             if let Some(existing) = self.lookup_ave_rw(wtxn, aid, val, ave_buf)? {
@@ -2227,8 +2250,8 @@ impl Conn {
         Ok(tables)
     }
 
-    /// Whether entity `eid` holds `val` for `aid`. NaN equals nothing. Datoms keep the sign of zero as written, so a
-    /// zero lookup checks both signs.
+    /// Whether entity `eid` holds `val` for `aid`. NaN equals nothing. New writes store zero as `+0.0`, but older
+    /// databases may hold `-0.0`, so a zero lookup checks both signs.
     fn eav_has(&self, rtxn: &ReadTxn<'_>, eid: EntityId, aid: AttrId, val: &Value, buf: &mut Vec<u8>) -> Result<bool, DatalogError> {
         if probe_key(val).is_none() {
             return Ok(false);

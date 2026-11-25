@@ -88,9 +88,8 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
   (no key-format change, so existing databases stay valid). Point lookups (`eav_has`) now check both signs of zero,
   so a `0.0` lookup finds an entity that holds `-0.0`. NaN equals nothing in EAV point lookups, AVE scans, and the
   hash probe. Before this, the indexed AVE scan matched NaN to NaN while the hash probe did not, so the same join
-  gave different answers by index. Tests: `join_shapes_test`. Still open: asserting `0.0` on an entity that holds
-  `-0.0` adds a second datom, because writes keep the sign. Canonicalizing zero on write would fix that, but it
-  changes stored keys and needs a migration for existing databases, so it is left for a decision.
+  gave different answers by index. Tests: `join_shapes_test`. Writes now store zero as `+0.0`; a legacy `-0.0` is
+  replaced on assert and found by retract, so no migration is needed (`zero_write_test`).
 - **Live WAL abort path: tested.** A test-only switch makes the next store commit fail after its log record is
   appended. The test checks the failed transaction is invisible, the log holds an abort marker, the connection keeps
   working, and the aborted record is not replayed after restart (`wal_abort_tests` in `lib.rs`).
