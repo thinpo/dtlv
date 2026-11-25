@@ -73,9 +73,9 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
   holds `-0.0` does not match a `0.0` point lookup on that entity (`(Some(e), Some(v))` in `eval_clauses`), and
   asserting `0.0` on it adds a second datom. Value equality says these are the same. Options: canonicalize zero in
   EAV keys too (reading back returns `0.0`), or keep the distinction and document it. Decide before 1.1.
-- **Live WAL abort path is untested.** Replay of aborted records is tested; the path where a store commit fails after
-  the append is not, because a failing commit cannot be forced on demand. Plan: inject a commit failure in a test
-  build (a feature flag or a wrapper around the store).
+- **Live WAL abort path: tested.** A test-only switch makes the next store commit fail after its log record is
+  appended. The test checks the failed transaction is invisible, the log holds an abort marker, the connection keeps
+  working, and the aborted record is not replayed after restart (`wal_abort_tests` in `lib.rs`).
 - **Vector graph after restart** is rebuilt from scratch on the first large search, which is O(n log n) and was about
   49 s debug for 20k vectors. Persisting the graph (see 1.3) removes that cost.
 
@@ -84,7 +84,6 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
 1. Decide the EAV zero question (section 2). The AVE part is done.
 2. Join shapes (1.1), tests first. This is the largest remaining optimizer item.
 3. Magic sets on prepared queries (1.2).
-4. The live WAL abort test (section 2).
 5. Smaller items in 1.3, by value to users.
 
 Each step is a separate branch, a test-first change, a workspace run, and a commit to `master`, per the standing

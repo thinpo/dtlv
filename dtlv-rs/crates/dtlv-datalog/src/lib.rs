@@ -1166,7 +1166,7 @@ impl Conn {
                 }
             }
         }
-        if let Err(e) = wtxn.commit() {
+        if let Err(e) = commit_txn(wtxn) {
             // The record is in the log but the store did not commit it: mark it aborted so replay skips it.
             if let (Some(lsn), Some(guard)) = (logged_lsn, wal_guard.as_mut()) {
                 if let Some(wal) = guard.as_mut() {
@@ -2593,6 +2593,22 @@ impl Conn {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: when set, the next logged transaction's store commit fails.
+    static FAIL_NEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commits a transaction. In tests, a pending injected failure makes the commit fail instead.
+fn commit_txn(wtxn: WriteTxn<'_>) -> Result<(), KvError> {
+    #[cfg(test)]
+    if FAIL_NEXT_COMMIT.with(|c| c.replace(false)) {
+        drop(wtxn);
+        return Err(KvError::Unsupported("injected commit failure"));
+    }
+    wtxn.commit()
+}
+
 /// Full-text document key for one datom: entity id, attribute id, then the encoded value. Each datom is
 /// its own document, so an entity's other values and attributes stay indexed when one is removed.
 fn fts_key(eid: EntityId, aid: AttrId, val: &Value) -> Vec<u8> {
@@ -3821,5 +3837,51 @@ mod tests {
         let rtxn2 = conn.read_txn().unwrap();
         assert_eq!(conn.get_attr(&rtxn2, venue_eid, ":venue/mic").unwrap(), None);
         assert!(conn.fulltext_search(&rtxn2, "apple", 5).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wal_abort_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn schema() -> Vec<AttrSpec> {
+        vec![AttrSpec::new(":w/name").unique_identity()]
+    }
+
+    fn name(n: &str) -> TxItem {
+        TxItem::Assert(None, vec![(":w/name".into(), Value::Str(n.into()))])
+    }
+
+    #[test]
+    fn a_failed_store_commit_after_logging_is_marked_aborted_and_never_replayed() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        conn.transact(&[name("kept")]).unwrap();
+
+        // The next store commit fails after its record is appended.
+        FAIL_NEXT_COMMIT.with(|c| c.set(true));
+        let err = conn.transact(&[name("lost")]);
+        assert!(matches!(err, Err(DatalogError::Kv(_))), "got {err:?}");
+
+        // The failed transaction is not visible, and the log now holds an abort marker for it.
+        let rtxn = conn.read_txn().unwrap();
+        assert_eq!(conn.lookup_entity_by_av(&rtxn, ":w/name", &Value::Str("lost".into())).unwrap(), None);
+        drop(rtxn);
+        let records = read_wal_records(&dir.path().join("wal.log")).unwrap();
+        assert_eq!(records.len(), 1, "only the committed transaction is replayable");
+
+        // The connection keeps working after the failure.
+        conn.transact(&[name("after")]).unwrap();
+        drop(conn);
+
+        // After a restart, replay applies the committed records and skips the aborted one.
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        let rtxn = conn.read_txn().unwrap();
+        let has = |n: &str| conn.lookup_entity_by_av(&rtxn, ":w/name", &Value::Str(n.into())).unwrap().is_some();
+        assert!(has("kept"));
+        assert!(has("after"));
+        assert!(!has("lost"), "aborted transaction was replayed after restart");
     }
 }
