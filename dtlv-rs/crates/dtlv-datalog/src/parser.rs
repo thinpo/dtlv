@@ -512,13 +512,7 @@ fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String,
         Edn::Symbol(s) => s.clone(),
         _ => return Err(ParseError::InvalidQuery("function name must be a symbol".into())),
     };
-    const KNOWN_FNS: &[&str] = &[
-        "get-else", "get-some", "get-some-else", "missing?", "ground", "tuple", "untuple", "in", "not-in", "inc", "dec", "+", "-",
-        "*", "/", "quot", "rem", "mod",
-    ];
-    if !KNOWN_FNS.contains(&name.as_str()) {
-        return Err(ParseError::InvalidQuery(format!("unknown predicate or function: {name}")));
-    }
+    // Names outside KNOWN_FNS may be user functions registered on the connection; they are resolved at evaluation.
     // Datalevin built-ins take the database as their first argument; the sole database is `$`.
     let args_edn = match inner.get(1) {
         Some(Edn::Symbol(s)) if s == "$" => &inner[2..],

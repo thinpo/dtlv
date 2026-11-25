@@ -238,13 +238,31 @@ fn prepared_query_accepts_typed_inputs_and_database_source() {
 }
 
 #[test]
-fn unknown_function_is_a_parse_error() {
+fn unknown_function_is_an_evaluation_error() {
     let conn = conn();
     let rtxn = conn.read_txn().unwrap();
     let err = conn
         .q_str(&rtxn, r#"[:find ?n :where [?e :person/name ?n] [(frobnicate ?n) ?x]]"#, &[])
         .unwrap_err();
-    assert!(matches!(err, DatalogError::Parse(_)), "got {err:?}");
+    assert!(matches!(err, DatalogError::Function(_)), "got {err:?}");
+}
+
+#[test]
+fn registered_query_functions_run_inside_clauses() {
+    let mut conn = conn();
+    conn.register_query_fn("double", |args| match &args[0] {
+        Value::I64(n) => Ok(Some(Value::I64(n * 2))),
+        _ => Ok(None),
+    });
+    let rtxn = conn.read_txn().unwrap();
+    let r = rows(
+        conn.q_str(&rtxn, r#"[:find ?e ?d :where [?e :person/age ?a] [(double ?a) ?d]]"#, &[]).unwrap(),
+    );
+    let mut r = r;
+    r.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(r.len(), 2);
+    assert!(r.iter().any(|row| row[1] == Value::I64(60)), "30 doubled is 60: {r:?}");
+    assert!(r.iter().any(|row| row[1] == Value::I64(14)), "7 doubled is 14: {r:?}");
 }
 
 #[test]

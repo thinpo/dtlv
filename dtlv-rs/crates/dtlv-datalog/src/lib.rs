@@ -250,6 +250,9 @@ impl TxView<'_, '_> {
     }
 }
 
+/// A user function callable from query clauses: `[(name ?x ...) ?out]`. `None` is nil.
+pub type QueryFn = Box<dyn Fn(&[Value]) -> Result<Option<Value>, DatalogError>>;
+
 pub type TxFn = Box<dyn Fn(&TxView<'_, '_>, &[Value]) -> Result<Vec<TxItem>, DatalogError>>;
 
 /// One datom added (`added: true`) or retracted by a committed transaction.
@@ -351,6 +354,7 @@ pub struct Conn {
     idoc_idx: RawDb,
     wal: std::sync::Mutex<Option<wal::Wal>>,
     listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
+    query_fns: HashMap<String, QueryFn>,
 }
 
 impl Conn {
@@ -475,6 +479,7 @@ impl Conn {
             idoc_idx,
             wal: std::sync::Mutex::new(None),
             listeners: Vec::new(),
+            query_fns: HashMap::new(),
         })
     }
 
@@ -1453,6 +1458,15 @@ impl Conn {
             return Ok(Some(decode_value(&k[12..])?));
         }
         Ok(None)
+    }
+
+    /// Registers a function callable from query clauses by name, e.g. `[(double ?n) ?d]`.
+    /// Unknown names are reported when the clause is evaluated, since the parser does not see the registry.
+    pub fn register_query_fn<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Option<Value>, DatalogError> + 'static,
+    {
+        self.query_fns.insert(name.to_owned(), Box::new(f));
     }
 
     /// Registers a listener that receives a `TxReport` after every committed transaction that changes data.
@@ -2616,7 +2630,10 @@ impl Conn {
                 check_arity(name, args, 2)?;
                 Some(num_op(name, &args[0], &args[1])?)
             }
-            other => return Err(DatalogError::Function(format!("unknown function: {other}"))),
+            other => match self.query_fns.get(other) {
+                Some(f) => return f(args),
+                None => return Err(DatalogError::Function(format!("unknown function: {other}"))),
+            },
         })
     }
 }
