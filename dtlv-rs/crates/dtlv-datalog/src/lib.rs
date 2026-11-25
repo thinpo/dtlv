@@ -1946,7 +1946,7 @@ impl Conn {
                         .map(|v| {
                             env.get(*v).map(|val| {
                                 let mut buf = Vec::new();
-                                encode_value(val, &mut buf);
+                                dtlv_codec::encode_value_indexed(val, &mut buf);
                                 buf
                             })
                         })

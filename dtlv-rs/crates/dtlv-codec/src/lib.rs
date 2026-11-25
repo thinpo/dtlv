@@ -251,6 +251,15 @@ pub fn encode_ea_prefix(e: EntityId, a: AttrId, out: &mut Vec<u8>) {
 }
 
 /// AVE prefix: [a: 4B][escaped(encoded_value)]
+/// Encoding for index keys. `-0.0` and `0.0` are equal values, so both are keyed as `0.0`; otherwise a lookup
+/// for one misses the other. The stored value itself is not changed (see `encode_value`).
+pub fn encode_value_indexed(val: &Value, out: &mut Vec<u8>) {
+    match val {
+        Value::F64(x) if *x == 0.0 => encode_value(&Value::F64(0.0), out),
+        other => encode_value(other, out),
+    }
+}
+
 pub fn encode_av_prefix(a: AttrId, val: &Value, out: &mut Vec<u8>) {
     thread_local! {
         static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
@@ -260,7 +269,7 @@ pub fn encode_av_prefix(a: AttrId, val: &Value, out: &mut Vec<u8>) {
     SCRATCH.with(|cell| {
         let mut tmp = cell.borrow_mut();
         tmp.clear();
-        encode_value(val, &mut tmp);
+        encode_value_indexed(val, &mut tmp);
         encode_escaped_bytes(&tmp, out);
     });
 }

@@ -67,10 +67,12 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
 
 ## 2. Defects found, not yet fixed
 
-- **Float equality in attribute-value indexes.** `probe_key` fixed the hash probe, but the AVE index still keys floats
-  by encoded bytes. A lookup for `0.0` misses a stored `-0.0` (and the reverse) through `lookup_entity_by_av` and
-  `index_range`, while scans treat them as equal. Fix: canonicalize the same way in `encode_av_prefix` callers, or
-  canonicalize when writing AVE keys. Needs a migration note, since AVE keys change for affected values.
+- **Float equality in attribute-value indexes: fixed.** AVE keys and idoc path keys now encode zero as `+0.0`
+  (`encode_value_indexed`), and the aggregate dedupe key does too. Tests: `float_index_test`.
+- **Float equality in EAV point lookups: open decision.** Datoms store the sign of zero as written, so an entity that
+  holds `-0.0` does not match a `0.0` point lookup on that entity (`(Some(e), Some(v))` in `eval_clauses`), and
+  asserting `0.0` on it adds a second datom. Value equality says these are the same. Options: canonicalize zero in
+  EAV keys too (reading back returns `0.0`), or keep the distinction and document it. Decide before 1.1.
 - **Live WAL abort path is untested.** Replay of aborted records is tested; the path where a store commit fails after
   the append is not, because a failing commit cannot be forced on demand. Plan: inject a commit failure in a test
   build (a feature flag or a wrapper around the store).
@@ -79,7 +81,7 @@ These are independent of 1.1 and 1.2 and can be taken in any order after them.
 
 ## 3. Order of work
 
-1. Fix the AVE float keys (section 2). Small and it is a correctness bug.
+1. Decide the EAV zero question (section 2). The AVE part is done.
 2. Join shapes (1.1), tests first. This is the largest remaining optimizer item.
 3. Magic sets on prepared queries (1.2).
 4. The live WAL abort test (section 2).

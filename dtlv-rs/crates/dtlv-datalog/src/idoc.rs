@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use dtlv_codec::{encode_escaped_bytes, encode_value, AttrId, EntityId, Value};
+use dtlv_codec::{encode_escaped_bytes, AttrId, EntityId, Value};
 use dtlv_kv::{ReadTxn, WriteTxn};
 use serde_json::Value as Json;
 
@@ -139,7 +139,7 @@ fn lookup_prefix(aid: AttrId, path: &[Seg], val: &Value) -> Vec<u8> {
     let mut key = aid.to_be_bytes().to_vec();
     encode_escaped_bytes(&encode_path(path), &mut key);
     let mut vbytes = Vec::new();
-    encode_value(val, &mut vbytes);
+    dtlv_codec::encode_value_indexed(val, &mut vbytes);
     encode_escaped_bytes(&vbytes, &mut key);
     key
 }
