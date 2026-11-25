@@ -472,3 +472,122 @@ pub fn idoc_value_edn(text: &str) -> Result<Value, DatalogError> {
     let canonical = serde_json::to_string(&json).map_err(|e| DatalogError::Type(e.to_string()))?;
     Ok(Value::Doc(canonical))
 }
+
+/// Normalizes a Markdown header into a map key, as Datalevin does: lowercase, leading list numbering removed,
+/// characters other than letters, digits, spaces and hyphens dropped, spaces to hyphens, hyphens collapsed
+/// and trimmed. An empty result is an error.
+pub fn normalize_header(title: &str) -> Result<String, DatalogError> {
+    let lower = title.trim().to_lowercase();
+    // Remove leading numbering such as "1. " or "2) ".
+    let trimmed = lower.trim_start_matches(|c: char| c.is_ascii_digit());
+    let stripped = if trimmed.len() != lower.len() {
+        trimmed.trim_start_matches(|c: char| c == '.' || c == ')' || c == '-' || c.is_whitespace())
+    } else {
+        lower.as_str()
+    };
+    let kept: String = stripped
+        .chars()
+        .filter(|c| c.is_alphabetic() || c.is_numeric() || c.is_whitespace() || *c == '-')
+        .collect();
+    let mut out = String::new();
+    for word in kept.split_whitespace() {
+        if !out.is_empty() {
+            out.push('-');
+        }
+        out.push_str(word);
+    }
+    let mut collapsed = String::new();
+    for c in out.chars() {
+        if !(c == '-' && collapsed.ends_with('-')) {
+            collapsed.push(c);
+        }
+    }
+    let result = collapsed.trim_matches('-').to_owned();
+    if result.is_empty() {
+        return Err(DatalogError::Type(format!("Markdown header normalizes to an empty key: {title}")));
+    }
+    Ok(result)
+}
+
+/// An ATX header line (`#` to `######`, then a space). Returns `(level, title)`.
+fn atx_header(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        Some((hashes, line[hashes..].trim().trim_end_matches('#').trim_end()))
+    } else {
+        None
+    }
+}
+
+/// Parses Markdown into the nested-map document Datalevin stores for `:markdown` idoc values.
+///
+/// Headers become keys (see `normalize_header`) and nest by level. A section's text becomes a string under its
+/// header's key; a section with subheaders holds a map instead. Text before the first header, a section with both
+/// text and subheaders, a repeated key under one parent, and an empty header are errors. Inline formatting is
+/// not interpreted: the text is the plain text of each non-blank line, joined by newlines.
+pub fn idoc_value_markdown(text: &str) -> Result<Value, DatalogError> {
+    fn ensure_map<'a>(root: &'a mut Json, path: &[String]) -> Result<&'a mut Json, DatalogError> {
+        let mut cur = root;
+        for key in path {
+            let obj = cur
+                .as_object_mut()
+                .ok_or_else(|| DatalogError::Type("Markdown header has both content and subheaders".into()))?;
+            cur = obj.entry(key.clone()).or_insert_with(|| Json::Object(serde_json::Map::new()));
+        }
+        Ok(cur)
+    }
+    fn flush(root: &mut Json, path: &[String], lines: &mut Vec<String>) -> Result<(), DatalogError> {
+        let content = lines.join("\n");
+        lines.clear();
+        if path.is_empty() {
+            if !content.trim().is_empty() {
+                return Err(DatalogError::Type("Markdown content appears before any header".into()));
+            }
+            return Ok(());
+        }
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+        let (last, parent) = path.split_last().expect("non-empty path");
+        let parent_map = ensure_map(root, parent)?
+            .as_object_mut()
+            .ok_or_else(|| DatalogError::Type("Markdown header has both content and subheaders".into()))?;
+        if parent_map.get(last).is_some_and(|v| v.is_object()) {
+            return Err(DatalogError::Type("Markdown header has both content and subheaders".into()));
+        }
+        parent_map.insert(last.clone(), Json::String(content));
+        Ok(())
+    }
+
+    let mut root = Json::Object(serde_json::Map::new());
+    let mut path: Vec<String> = Vec::new();
+    let mut levels: Vec<usize> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        if let Some((level, title)) = atx_header(raw.trim_start()) {
+            flush(&mut root, &path, &mut lines)?;
+            while levels.last().is_some_and(|&l| l >= level) {
+                levels.pop();
+                path.pop();
+            }
+            let key = normalize_header(title)?;
+            let parent = ensure_map(&mut root, &path)?;
+            let parent_map = parent
+                .as_object_mut()
+                .ok_or_else(|| DatalogError::Type("Markdown header has both content and subheaders".into()))?;
+            if parent_map.contains_key(&key) {
+                return Err(DatalogError::Type(format!("Markdown header collision after normalization: {title}")));
+            }
+            path.push(key);
+            levels.push(level);
+        } else if !raw.trim().is_empty() {
+            if path.is_empty() {
+                return Err(DatalogError::Type("Markdown content appears before any header".into()));
+            }
+            lines.push(raw.trim().to_owned());
+        }
+    }
+    flush(&mut root, &path, &mut lines)?;
+    let canonical = serde_json::to_string(&root).map_err(|e| DatalogError::Type(e.to_string()))?;
+    Ok(Value::Doc(canonical))
+}
