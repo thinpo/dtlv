@@ -271,3 +271,52 @@ fn save_to_sqlite_replaces_destination_and_leaves_no_temp_files() {
     let names = restored.q_str(&rtxn, "[:find ?n :where [?e :person/name ?n]]", &[]).unwrap();
     assert_eq!(names, QueryResult::Rel(vec![vec![Value::Str("Z".into())]]));
 }
+
+#[test]
+fn failed_save_keeps_previous_snapshot_readable() {
+    let dir = tempdir().unwrap();
+    let dst = dir.path().join("snap.sqlite");
+    let schema = || {
+        vec![
+            AttrSpec::new(":person/id").unique_identity(),
+            AttrSpec::new(":person/name"),
+        ]
+    };
+
+    let first = person_conn(&dir.path().join("lmdb1"), 2, &["A", "B"]);
+    {
+        let rtxn = first.read_txn().unwrap();
+        first.save_to_sqlite(&rtxn, &dst).unwrap();
+    }
+
+    // A directory at the temp path makes the next save fail; the destination must survive.
+    std::fs::create_dir(dir.path().join("snap.sqlite.tmp")).unwrap();
+    let second = person_conn(&dir.path().join("lmdb2"), 1, &["Z"]);
+    {
+        let rtxn = second.read_txn().unwrap();
+        assert!(second.save_to_sqlite(&rtxn, &dst).is_err());
+    }
+
+    let restored = Conn::load_from_sqlite(dir.path().join("lmdb3"), &dst, schema()).unwrap();
+    let rtxn = restored.read_txn().unwrap();
+    match restored.q_str(&rtxn, "[:find ?n :where [?e :person/name ?n]]", &[]).unwrap() {
+        QueryResult::Rel(rows) => assert_eq!(rows.len(), 2, "previous snapshot was lost"),
+        other => panic!("expected Rel, got {other:?}"),
+    }
+}
+
+#[test]
+fn order_by_query_dedups_before_offset_and_limit() {
+    let dir = tempdir().unwrap();
+    let conn = person_conn(dir.path(), 4, &["A", "A", "B", "C"]);
+    let rtxn = conn.read_txn().unwrap();
+    // Distinct sorted values are [A, B, C]; offset 1 / limit 1 must yield [B].
+    let res = conn
+        .q_str(
+            &rtxn,
+            r#"{:find [?n ...] :where [[?e :person/name ?n]] :order-by [[?n :asc]] :offset 1 :limit 1}"#,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(res, QueryResult::Coll(vec![Value::Str("B".into())]));
+}
