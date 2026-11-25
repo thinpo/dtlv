@@ -19,7 +19,7 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Query | built-ins `get-else get-some get-some-else missing? ground tuple untuple in not-in inc dec + - * / quot rem mod` | done (nil is the keyword `:nil`) |
 | Query | `:in` scalar, collection, tuple, relation bindings (`QueryInput`, `q_str_inputs`, `execute_inputs`) | done |
 | Query | `or-join` / `not-join` join-variable scoping | done |
-| Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are naive fixpoint) |
+| Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are semi-naive fixpoint (transitive closure over a 200-node chain: 4 s debug, was 522 s)) |
 | Query | cost-based ordering of datom clauses (greedy, index-aware), `explain` (access path and estimate per clause), `analyze` (rows and time per clause); no join algorithms or statistics beyond AVE counts | partial |
 | Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
 | Query | nested queries `[(q [:find ...] $ args...) [[?a ?b]]]` (positional binding, correlated per outer binding, constant ones run once; nested queries see the outer query's rules) | done |

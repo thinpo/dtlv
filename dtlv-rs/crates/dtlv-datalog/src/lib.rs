@@ -2041,43 +2041,95 @@ impl Conn {
         rtxn: &ReadTxn<'_>,
         rule_map: &HashMap<String, Vec<RuleDef>>,
     ) -> Result<HashMap<String, Vec<Vec<Value>>>, DatalogError> {
+        // Semi-naive evaluation. `tables[name]` holds every tuple derived so far; `tables[delta_key(name)]` holds
+        // the tuples new in the previous round. A recursive rule is re-derived once per recursive call, with that
+        // call reading the delta, so each round only produces tuples that use something new.
+        let delta_key = |n: &str| format!("\u{1}delta:{n}");
         let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
         let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
         for name in rule_map.keys() {
             tables.insert(name.clone(), Vec::new());
+            tables.insert(delta_key(name), Vec::new());
             seen.insert(name.clone(), HashSet::new());
         }
+        let recursive_calls = |body: &[Clause]| -> Vec<usize> {
+            body.iter()
+                .enumerate()
+                .filter_map(|(i, c)| match c {
+                    Clause::RuleCall(n, _) if rule_map.contains_key(n) => Some(i),
+                    _ => None,
+                })
+                .collect()
+        };
+        fn mentions_rule(c: &Clause, rule_map: &HashMap<String, Vec<RuleDef>>) -> bool {
+            match c {
+                Clause::RuleCall(n, _) => rule_map.contains_key(n),
+                Clause::Or(bs) | Clause::OrJoin(_, bs) => bs.iter().flatten().any(|c| mentions_rule(c, rule_map)),
+                Clause::Not(inner) | Clause::NotJoin(_, inner) => inner.iter().any(|c| mentions_rule(c, rule_map)),
+                _ => false,
+            }
+        }
 
-        // Fixed-point semi-naive iteration for recursive rules
+        let mut first = true;
         loop {
-            let mut changed = false;
+            let mut produced: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
             for (name, defs) in rule_map {
                 for def in defs {
-                    let envs = self.eval_clauses(rtxn, &def.body, vec![HashMap::new()], &tables)?;
-                    for env in envs {
-                        let mut tuple = Vec::with_capacity(def.params.len());
-                        let mut ok = true;
-                        for p in &def.params {
-                            if let Some(v) = env.get(p) {
-                                tuple.push(v.clone());
-                            } else {
-                                ok = false;
-                                break;
+                    let calls = recursive_calls(&def.body);
+                    let variants: Vec<Vec<Clause>> = if first {
+                        vec![def.body.clone()]
+                    } else if !calls.is_empty() {
+                        calls
+                            .iter()
+                            .map(|&j| {
+                                let mut body = def.body.clone();
+                                if let Clause::RuleCall(n, args) = &body[j] {
+                                    body[j] = Clause::RuleCall(delta_key(n), args.clone());
+                                }
+                                body
+                            })
+                            .collect()
+                    } else if def.body.iter().any(|c| mentions_rule(c, rule_map)) {
+                        // Recursion hidden inside `or`/`not` cannot be redirected to the delta; re-derive in full.
+                        vec![def.body.clone()]
+                    } else {
+                        continue;
+                    };
+                    for body in variants {
+                        let envs = self.eval_clauses(rtxn, &body, vec![HashMap::new()], &tables)?;
+                        for env in envs {
+                            let mut tuple = Vec::with_capacity(def.params.len());
+                            let mut ok = true;
+                            for p in &def.params {
+                                match env.get(p) {
+                                    Some(v) => tuple.push(v.clone()),
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        if ok {
-                            let key = format!("{:?}", tuple);
-                            if seen.get_mut(name).unwrap().insert(key) {
-                                tables.get_mut(name).unwrap().push(tuple);
-                                changed = true;
+                            if ok && seen.get_mut(name).unwrap().insert(format!("{:?}", tuple)) {
+                                produced.entry(name.clone()).or_default().push(tuple);
                             }
                         }
                     }
                 }
             }
-            if !changed {
+            let mut any = false;
+            for name in rule_map.keys() {
+                let new = produced.remove(name).unwrap_or_default();
+                any |= !new.is_empty();
+                tables.get_mut(name).unwrap().extend(new.iter().cloned());
+                tables.insert(delta_key(name), new);
+            }
+            if !any {
                 break;
             }
+            first = false;
+        }
+        for name in rule_map.keys() {
+            tables.remove(&delta_key(name));
         }
         Ok(tables)
     }
