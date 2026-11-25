@@ -99,6 +99,28 @@ pub enum DatalogError {
     UnknownRule(String),
     #[error("compare-and-swap failed for entity {eid} attr {attr}")]
     CasFailed { eid: EntityId, attr: String },
+    #[error("integer overflow in sum aggregate")]
+    SumOverflow,
+}
+
+/// Removes a SQLite database file and its WAL/SHM sidecars; missing files are fine.
+fn remove_sqlite_files(path: &Path) -> Result<(), DatalogError> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(dtlv_kv::KvError::from(e).into()),
+        }
+    }
+    Ok(())
+}
+
+fn sibling_tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".tmp");
+    p.into()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -302,7 +324,12 @@ impl Conn {
         rtxn: &ReadTxn<'_>,
         sqlite_path: P,
     ) -> Result<(), DatalogError> {
-        let dst = KvStore::open_sqlite(sqlite_path)?;
+        // Write to a sibling temp file and rename over the destination on success,
+        // so a failed save never leaves a half-written or stale snapshot behind.
+        let path = sqlite_path.as_ref();
+        let tmp = sibling_tmp_path(path);
+        remove_sqlite_files(&tmp)?;
+        let dst = KvStore::open_sqlite(&tmp)?;
         let mut wtxn = dst.write_txn()?;
         for (dbi_name, s_db) in [
             ("meta", &self.meta),
@@ -326,6 +353,10 @@ impl Conn {
         }
         wtxn.commit()?;
         dst.sync()?;
+        drop(dst); // closing the last connection checkpoints and removes the tmp WAL
+        // Drop any stale sidecars that belonged to the old destination before replacing it.
+        remove_sqlite_files(path)?;
+        std::fs::rename(&tmp, path).map_err(dtlv_kv::KvError::from)?;
         Ok(())
     }
 
@@ -776,6 +807,33 @@ impl Conn {
         eid: EntityId,
         ave_buf: &mut Vec<u8>,
     ) -> Result<(), DatalogError> {
+        // Remove incoming references to this entity from other entities.
+        // vae keys are target(8) | aid(4) | src(8); collect before deleting.
+        let vae_prefix = eid.to_be_bytes();
+        let mut incoming: Vec<(EntityId, AttrId)> = Vec::new();
+        for r in self.vae.prefix_iter_rw(wtxn, &vae_prefix)? {
+            let (k, _) = r?;
+            if k.len() != 20 {
+                return Err(CodecError::UnexpectedEof.into());
+            }
+            let aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
+            let src = u64::from_be_bytes(k[12..20].try_into().unwrap());
+            incoming.push((src, aid));
+        }
+        for (src, aid) in incoming {
+            let val = Value::Ref(eid);
+            encode_eav_key(src, aid, &val, ave_buf);
+            self.eav.delete(wtxn, ave_buf)?;
+            if let Some(spec) = self.attrs.get(&aid) {
+                if spec.index {
+                    encode_ave_key(aid, &val, src, ave_buf);
+                    self.ave.delete(wtxn, ave_buf)?;
+                }
+            }
+            encode_vae_key(eid, aid, src, ave_buf);
+            self.vae.delete(wtxn, ave_buf)?;
+        }
+
         let prefix = eid.to_be_bytes();
         let entries: Vec<Vec<u8>> = self
             .eav
@@ -1054,12 +1112,12 @@ impl Conn {
                             Term::Var(var) => env.get(var).and_then(|v| v.as_ref()),
                             Term::Val(v) => v.as_ref(),
                         };
+                        let entity_val;
                         let bound_v: Option<&Value> = match v_term {
                             Term::Val(v) => Some(v),
                             Term::Entity(id) => {
-                                // Handled via Ref
-                                let _ = id;
-                                None
+                                entity_val = Value::Ref(*id);
+                                Some(&entity_val)
                             }
                             Term::Var(var) => env.get(var),
                         };
@@ -1090,7 +1148,13 @@ impl Conn {
                                     let eid = decode_ave_entity(&k)?;
                                     let mut e2 = env.clone();
                                     if let Term::Var(ename) = e_term {
-                                        e2.insert(ename.clone(), Value::Ref(eid));
+                                        if let Some(existing) = e2.get(ename) {
+                                            if existing != &Value::Ref(eid) {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                        }
                                     }
                                     next_envs.push(e2);
                                 }
@@ -1115,10 +1179,22 @@ impl Conn {
                                     }
                                     let mut e2 = env.clone();
                                     if let Term::Var(ename) = e_term {
-                                        e2.insert(ename.clone(), Value::Ref(eid));
+                                        if let Some(existing) = e2.get(ename) {
+                                            if existing != &Value::Ref(eid) {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                        }
                                     }
                                     if let Term::Var(vname) = v_term {
-                                        e2.insert(vname.clone(), val);
+                                        if let Some(existing) = e2.get(vname) {
+                                            if existing != &val {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(vname.clone(), val.clone());
+                                        }
                                     }
                                     next_envs.push(e2);
                                 }
@@ -1236,6 +1312,23 @@ impl Conn {
             });
         }
 
+        // Dedup before offset/limit so distinct rows are not truncated prematurely.
+        // Pull elements key on their entity var so each pulled entity stays distinct.
+        if parsed.order_by.is_empty() {
+            let mut seen = HashSet::new();
+            envs.retain(|env| {
+                let key: Vec<Option<&Value>> = parsed
+                    .find
+                    .iter()
+                    .map(|elem| match elem {
+                        FindElem::Var(v) | FindElem::Pull(v, _) => env.get(v),
+                        FindElem::Agg(_, _) => None,
+                    })
+                    .collect();
+                seen.insert(format!("{:?}", key))
+            });
+        }
+
         let start = parsed.offset.unwrap_or(0).max(0) as usize;
         let envs_slice: Vec<HashMap<String, Value>> = if start >= envs.len() {
             Vec::new()
@@ -1272,13 +1365,8 @@ impl Conn {
             }
         }
 
+        // Rows are already deduplicated above when no :order-by is present.
         let mut rows = Vec::with_capacity(envs_slice.len());
-        let dedup = parsed.order_by.is_empty() && envs_slice.len() > 1;
-        let mut seen = if dedup {
-            HashSet::with_capacity(envs_slice.len())
-        } else {
-            HashSet::new()
-        };
         for env in &envs_slice {
             let mut row = Vec::with_capacity(parsed.find.len());
             for elem in &parsed.find {
@@ -1290,14 +1378,7 @@ impl Conn {
                     row.push(val);
                 }
             }
-            if dedup {
-                let key = format!("{:?}", row);
-                if seen.insert(key) {
-                    rows.push(row);
-                }
-            } else {
-                rows.push(row);
-            }
+            rows.push(row);
         }
 
         if let Some(keys) = &parsed.return_keys {
@@ -1401,7 +1482,13 @@ impl Conn {
                                     let val = decode_value(&k[12..])?;
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(vname) = v_term {
-                                        e2.insert(vname.clone(), val);
+                                        if let Some(existing) = e2.get(vname) {
+                                            if existing != &val {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(vname.clone(), val.clone());
+                                        }
                                     }
                                     next_envs.push(e2);
                                 }
@@ -1413,7 +1500,13 @@ impl Conn {
                                     let eid = decode_ave_entity(&k)?;
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(ename) = e_term {
-                                        e2.insert(ename.clone(), Value::Ref(eid));
+                                        if let Some(existing) = e2.get(ename) {
+                                            if existing != &Value::Ref(eid) {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                        }
                                     }
                                     next_envs.push(e2);
                                 }
@@ -1437,10 +1530,22 @@ impl Conn {
                                     }
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(ename) = e_term {
-                                        e2.insert(ename.clone(), Value::Ref(eid));
+                                        if let Some(existing) = e2.get(ename) {
+                                            if existing != &Value::Ref(eid) {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(ename.clone(), Value::Ref(eid));
+                                        }
                                     }
                                     if let ExprTerm::Var(vname) = v_term {
-                                        e2.insert(vname.clone(), val);
+                                        if let Some(existing) = e2.get(vname) {
+                                            if existing != &val {
+                                                continue;
+                                            }
+                                        } else {
+                                            e2.insert(vname.clone(), val.clone());
+                                        }
                                     }
                                     next_envs.push(e2);
                                 }
@@ -1753,10 +1858,16 @@ fn aggregate_envs(
                     let agg_val = match op {
                         AggOp::Count => Value::I64(vals.len() as i64),
                         AggOp::Sum => {
-                            let s: f64 = vals.iter().filter_map(|v| value_as_f64(v)).sum();
                             if vals.iter().all(|v| matches!(v, Value::I64(_))) {
-                                Value::I64(s as i64)
+                                let mut s: i64 = 0;
+                                for v in &vals {
+                                    if let Some(x) = v.as_i64() {
+                                        s = s.checked_add(x).ok_or(DatalogError::SumOverflow)?;
+                                    }
+                                }
+                                Value::I64(s)
                             } else {
+                                let s: f64 = vals.iter().filter_map(|v| value_as_f64(v)).sum();
                                 Value::F64(s)
                             }
                         }

@@ -89,6 +89,8 @@ impl<'a> Drop for SqliteWriteTxn<'a> {
 
 pub struct MemWriteTxn<'a> {
     root: &'a RwLock<HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>>,
+    // Held for the txn's lifetime to serialize writers; readers never take it.
+    _writer: MutexGuard<'a, ()>,
     delta: HashMap<String, BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
 }
 
@@ -633,7 +635,10 @@ pub enum KvStore {
     Lmdb { env: Env },
     Sqlite { conn: Mutex<Connection> },
     Redb { db: redb::Database },
-    Mem { tables: RwLock<HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>> },
+    Mem {
+        tables: RwLock<HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>>,
+        writer: Mutex<()>,
+    },
 }
 
 impl KvStore {
@@ -678,6 +683,7 @@ impl KvStore {
     pub fn open_mem() -> Self {
         Self::Mem {
             tables: RwLock::new(HashMap::new()),
+            writer: Mutex::new(()),
         }
     }
 
@@ -718,7 +724,7 @@ impl KvStore {
             KvStore::Lmdb { env } => Ok(ReadTxn::Lmdb(env.read_txn()?)),
             KvStore::Sqlite { conn } => Ok(ReadTxn::Sqlite(conn.lock().unwrap())),
             KvStore::Redb { db } => Ok(ReadTxn::Redb(db.begin_read()?)),
-            KvStore::Mem { tables } => Ok(ReadTxn::Mem(tables.read().unwrap())),
+            KvStore::Mem { tables, .. } => Ok(ReadTxn::Mem(tables.read().unwrap())),
         }
     }
 
@@ -735,10 +741,14 @@ impl KvStore {
                 }))
             }
             KvStore::Redb { db } => Ok(WriteTxn::Redb(db.begin_write()?)),
-            KvStore::Mem { tables } => Ok(WriteTxn::Mem(MemWriteTxn {
-                root: tables,
-                delta: HashMap::new(),
-            })),
+            KvStore::Mem { tables, writer } => {
+                let _writer = writer.lock().unwrap();
+                Ok(WriteTxn::Mem(MemWriteTxn {
+                    root: tables,
+                    _writer,
+                    delta: HashMap::new(),
+                }))
+            }
         }
     }
 
