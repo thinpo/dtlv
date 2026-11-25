@@ -8,6 +8,9 @@ use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
 
 use crate::stem::stem_en;
 
+/// Custom tokenizer: text in, `(term, position)` pairs out. Not persisted; register it after every open.
+pub type Analyzer = std::sync::Arc<dyn Fn(&str) -> Vec<(String, u32)> + Send + Sync>;
+
 /// Analysis settings. They are fixed once documents are indexed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FtsConfig {
@@ -137,6 +140,7 @@ pub struct FullTextIndex {
     doc_terms: RawDb,
     meta: RawDb,
     cfg: FtsConfig,
+    analyzer: Option<Analyzer>,
 }
 
 impl FullTextIndex {
@@ -149,11 +153,23 @@ impl FullTextIndex {
             Some(b) if b.len() == 1 => FtsConfig::from_bits(b[0]),
             _ => FtsConfig::default(),
         };
-        Ok(Self { postings, doc_lens, doc_terms, meta, cfg })
+        Ok(Self { postings, doc_lens, doc_terms, meta, cfg, analyzer: None })
     }
 
     pub fn config(&self) -> FtsConfig {
         self.cfg
+    }
+
+    /// Replaces the default analyzer for indexing and queries. `None` restores the default.
+    pub fn set_analyzer(&mut self, a: Option<Analyzer>) {
+        self.analyzer = a;
+    }
+
+    fn tokens(&self, text: &str) -> Vec<(String, u32)> {
+        match &self.analyzer {
+            Some(a) => a(text),
+            None => analyze(text, self.cfg),
+        }
     }
 
     /// Stores new analysis settings. Refused once any document is indexed, since existing postings
@@ -207,7 +223,7 @@ impl FullTextIndex {
     pub fn index_entry(&self, wtxn: &mut WriteTxn<'_>, doc: &[u8], text: &str) -> Result<(), KvError> {
         self.remove_entry(wtxn, doc)?;
 
-        let tokens = analyze(text, self.cfg);
+        let tokens = self.tokens(text);
         if tokens.is_empty() {
             return Ok(());
         }
@@ -333,7 +349,7 @@ impl FullTextIndex {
         match q {
             Query::Text(text) => {
                 let mut out: HashMap<EntityId, f64> = HashMap::new();
-                for (term, _) in analyze(text, self.cfg) {
+                for (term, _) in self.tokens(text) {
                     merge_or(&mut out, Self::collapse(self.term_docs(rtxn, &term, stats)?));
                 }
                 Ok(out)
@@ -402,7 +418,7 @@ impl FullTextIndex {
         if !self.cfg.index_positions {
             return Err(KvError::Config("phrase search requires index_positions".into()));
         }
-        let tokens = analyze(text, self.cfg);
+        let tokens = self.tokens(text);
         let Some(&(_, base)) = tokens.first() else {
             return Ok(HashMap::new());
         };
@@ -483,7 +499,7 @@ impl FullTextIndex {
             return Ok(Vec::new());
         }
         let mut docs: HashMap<Vec<u8>, f64> = HashMap::new();
-        for (term, _) in analyze(query, self.cfg) {
+        for (term, _) in self.tokens(query) {
             for (doc, score) in self.term_docs(rtxn, &term, stats)? {
                 *docs.entry(doc).or_insert(0.0) += score;
             }

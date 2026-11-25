@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use hnsw::Hnsw;
 
-pub use fulltext::{analyze, tokenize, FtsConfig, FullTextIndex, Query};
+pub use fulltext::{analyze, tokenize, Analyzer, FtsConfig, FullTextIndex, Query};
 
 use dtlv_codec::EntityId;
 use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};

@@ -1753,6 +1753,13 @@ impl Conn {
         Ok(())
     }
 
+    /// Replaces the full-text analyzer (`None` restores the default). The analyzer is not persisted: register
+    /// the same analyzer after every open, before indexing or searching. Changing it after documents are
+    /// indexed makes old and new terms disagree (re-index to fix).
+    pub fn set_fulltext_analyzer(&mut self, a: Option<dtlv_search::Analyzer>) {
+        self.fts.set_analyzer(a);
+    }
+
     /// Evaluates a boolean/phrase full-text query tree, returning `(entity, score)` pairs.
     pub fn fulltext_query(
         &self,
@@ -2691,6 +2698,43 @@ impl Conn {
                             (FnOut::Tuple(_), Some(_)) => {
                                 return Err(DatalogError::Function(format!("{name} must return a tuple")));
                             }
+                            (FnOut::Coll(x), Some(Value::Tuple(items))) => {
+                                for item in items {
+                                    let mut e = env.clone();
+                                    if bind_var(&mut e, x, item) {
+                                        next_envs.push(e);
+                                    }
+                                }
+                            }
+                            (FnOut::Coll(_), None) => {}
+                            (FnOut::Coll(_), Some(_)) => {
+                                return Err(DatalogError::Function(format!("{name} must return a tuple")));
+                            }
+                            (FnOut::Rel(xs), Some(Value::Tuple(rows))) => {
+                                for row in rows {
+                                    let Value::Tuple(vs) = row else {
+                                        return Err(DatalogError::Function(format!("{name} rows must be tuples")));
+                                    };
+                                    if vs.len() != xs.len() {
+                                        return Err(DatalogError::Function(format!(
+                                            "{name} returned a row of {} values for {} bindings",
+                                            vs.len(),
+                                            xs.len()
+                                        )));
+                                    }
+                                    let mut e = env.clone();
+                                    if xs.iter().zip(vs).all(|(x, v)| match x {
+                                        Some(var) => bind_var(&mut e, var, v),
+                                        None => true,
+                                    }) {
+                                        next_envs.push(e);
+                                    }
+                                }
+                            }
+                            (FnOut::Rel(_), None) => {}
+                            (FnOut::Rel(_), Some(_)) => {
+                                return Err(DatalogError::Function(format!("{name} must return a tuple of rows")));
+                            }
                         }
                     }
                 }
@@ -3030,6 +3074,30 @@ impl Conn {
                 Some(args[0].clone())
             }
             "tuple" => Some(Value::Tuple(args.to_vec())),
+            "vec-neighbors" => {
+                check_arity(name, args, 2)?;
+                let query = match &args[0] {
+                    Value::Tuple(xs) => xs
+                        .iter()
+                        .map(|x| match x {
+                            Value::I64(i) => Ok(*i as f32),
+                            Value::F64(f) => Ok(*f as f32),
+                            _ => Err(DatalogError::Function("vec-neighbors query must be a tuple of numbers".into())),
+                        })
+                        .collect::<Result<Vec<f32>, _>>()?,
+                    _ => return Err(DatalogError::Function("vec-neighbors query must be a tuple of numbers".into())),
+                };
+                let k = match &args[1] {
+                    Value::I64(k) if *k >= 0 => *k as usize,
+                    _ => return Err(DatalogError::Function("vec-neighbors k must be a non-negative integer".into())),
+                };
+                let hits = self.search_vec(rtxn, &query, k)?;
+                Some(Value::Tuple(
+                    hits.into_iter()
+                        .map(|(e, d)| Value::Tuple(vec![Value::Ref(e), Value::F64(d as f64)]))
+                        .collect(),
+                ))
+            }
             "untuple" => {
                 check_arity(name, args, 1)?;
                 match &args[0] {

@@ -65,16 +65,19 @@ Known limits to keep: rules with `or`, `not`, or nested queries still fall back 
 
 ### 1.3 Smaller open items (in `PARITY.md`)
 
-- Vector index: persisted graph done (`Conn::save_vector_graph`, explicit; loaded on the first large search after
-  restart and caught up from the log; ~160 KB per 1k dim-8 vectors). Open: quantization, `vec-neighbors` as a query
-  function, automatic saving.
+- Vector index: persisted graph done (saved automatically on the first vector write after a rebuild, or with
+  `Conn::save_vector_graph`; ~160 KB per 1k dim-8 vectors). `vec-neighbors` query function done
+  (`[(vec-neighbors ?q k) [[?e ?dist]]]`; function clauses now accept `[?x ...]` and `[[?a ?b]]` bindings).
+  Open: quantization.
 - Idoc: array values inside patterns done (containment semantics).
 - Transactions: `with` simulation. `:db/ensure` is done (`TxItem::Ensure`, `register_ensure_fn`; runs at end of tx
   on uncommitted state; not logged, so replay never needs the predicate; no EDN tx parser exists to wire it into).
 - Schema: changing cardinality or uniqueness in place is done (`update_schema`, validated against existing data;
   tests `schema_change_test`). Attribute specs are not persisted, so callers must pass the new spec to `open`.
-- Durability: segmented txlog, automatic checkpoints and retention, env flags for no-sync writes, group commit.
-- Search: custom analyzers. Paging and entity filters are done (`fulltext_query_page`; filter runs before ranking;
+- Durability: automatic checkpoints by log size done (`set_wal_checkpoint_bytes`). Open: segmented txlog, env
+  flags for no-sync store writes, group commit.
+- Search: custom analyzers done (`set_fulltext_analyzer`, not persisted: re-register after open). Paging and entity
+  filters are done (`fulltext_query_page`; filter runs before ranking;
   ties by entity id). Prefix and fuzzy terms are done (`[:prefix "s"]`,
   `[:fuzzy "s" d]`, d <= 2; matched against stemmed index terms; fuzzy scans the term dictionary).
 - Transactions: `with` needs reads through an uncommitted write txn, which no backend's `ReadTxn` supports; needs

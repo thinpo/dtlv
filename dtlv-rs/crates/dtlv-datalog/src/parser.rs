@@ -237,6 +237,10 @@ pub enum FnOut {
     Var(String),
     /// One entry per tuple position; `None` is an ignored (`_`) position.
     Tuple(Vec<Option<String>>),
+    /// `[?x ...]`: one result row per element of a collection.
+    Coll(String),
+    /// `[[?a ?b]]`: one result row per tuple; `None` is an ignored (`_`) position.
+    Rel(Vec<Option<String>>),
 }
 
 /// One `:in` input binding: `?x`, `[?x ...]`, `[?a ?b]`, or `[[?a ?b] ...]`.
@@ -538,15 +542,20 @@ fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String,
         None => FnOut::None,
         Some(Edn::Symbol(s)) if s == "_" => FnOut::None,
         Some(Edn::Symbol(s)) if s.starts_with('?') => FnOut::Var(s.clone()),
-        Some(Edn::Vec(vs)) => FnOut::Tuple(
-            vs.iter()
-                .map(|v| match v {
-                    Edn::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
-                    Edn::Symbol(s) if s == "_" => Ok(None),
-                    _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars or _".into())),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        Some(Edn::Vec(vs)) => {
+            let var_or_none = |v: &Edn| match v {
+                Edn::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
+                Edn::Symbol(s) if s == "_" => Ok(None),
+                _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars or _".into())),
+            };
+            match vs.as_slice() {
+                [Edn::Symbol(s), d] if s.starts_with('?') && matches!(d, Edn::Symbol(e) if e == "...") => {
+                    FnOut::Coll(s.clone())
+                }
+                [Edn::Vec(row)] if !row.is_empty() => FnOut::Rel(row.iter().map(var_or_none).collect::<Result<_, _>>()?),
+                _ => FnOut::Tuple(vs.iter().map(var_or_none).collect::<Result<_, _>>()?),
+            }
+        }
         Some(other) => return Err(ParseError::InvalidQuery(format!("invalid function output: {:?}", other))),
     };
     if items.len() > 2 {
