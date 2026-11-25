@@ -1786,9 +1786,15 @@ impl Conn {
     }
 
     /// Runs a nested query on its own bindings and returns its rows.
-    fn run_nested(&self, rtxn: &ReadTxn<'_>, query: &ParsedQuery, inputs: Vec<QueryInput>) -> Result<Vec<Vec<Value>>, DatalogError> {
+    fn run_nested(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query: &ParsedQuery,
+        inputs: Vec<QueryInput>,
+        rule_tables: &HashMap<String, Vec<Vec<Value>>>,
+    ) -> Result<Vec<Vec<Value>>, DatalogError> {
         let seed = seed_envs(&query.in_bindings, &inputs)?;
-        let envs = self.eval_clauses(rtxn, &query.clauses, seed, &HashMap::new())?;
+        let envs = self.eval_clauses(rtxn, &query.clauses, seed, rule_tables)?;
         Ok(match self.finalize_query_result(rtxn, query, envs)? {
             QueryResult::Rel(rows) => rows,
             QueryResult::Coll(vals) => vals.into_iter().map(|v| vec![v]).collect(),
@@ -2188,7 +2194,7 @@ impl Conn {
                                         None => return Err(DatalogError::UnboundVar(format!("{a:?}"))),
                                     }
                                 }
-                                let rows = self.run_nested(rtxn, query, inputs)?;
+                                let rows = self.run_nested(rtxn, query, inputs, rule_tables)?;
                                 if uncorrelated {
                                     shared = Some(rows.clone());
                                 }
