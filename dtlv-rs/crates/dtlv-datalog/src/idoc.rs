@@ -188,7 +188,12 @@ pub fn idoc_get(doc_text: &str, path: &[PathSeg]) -> Option<Json> {
 }
 
 /// Converts a JSON object pattern such as `{"profile": {"age": 30}}` into conjunctive leaf predicates.
-/// Arrays are not allowed in patterns; use explicit `PathSeg::Index` predicates for positions.
+///
+/// An array in a pattern means the document's array at that path contains every listed element:
+/// `{"tags": ["a", "b"]}` becomes `(tags, "a")` and `(tags, "b")`. Object elements recurse with the same
+/// path and no index, so `{"items": [{"sku": 1}]}` becomes `(items.sku, 1)`. Nested arrays recurse the same way.
+/// Known limit: for an object element with several fields, each field may be satisfied by a different
+/// array element. Empty arrays are an error. The root must be an object.
 pub fn pattern_predicates(pattern: &Json) -> Result<Vec<(Vec<PathSeg>, Value)>, DatalogError> {
     fn walk(p: &Json, path: &mut Vec<PathSeg>, out: &mut Vec<(Vec<PathSeg>, Value)>) -> Result<(), DatalogError> {
         match p {
@@ -200,7 +205,15 @@ pub fn pattern_predicates(pattern: &Json) -> Result<Vec<(Vec<PathSeg>, Value)>, 
                 }
                 Ok(())
             }
-            Json::Array(_) => Err(DatalogError::Type("idoc patterns cannot contain arrays".into())),
+            Json::Array(items) => {
+                if items.is_empty() {
+                    return Err(DatalogError::Type("idoc patterns cannot contain empty arrays".into()));
+                }
+                for item in items {
+                    walk(item, path, out)?;
+                }
+                Ok(())
+            }
             scalar => {
                 out.push((path.clone(), scalar_value(scalar)));
                 Ok(())

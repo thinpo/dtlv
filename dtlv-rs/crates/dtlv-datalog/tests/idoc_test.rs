@@ -148,9 +148,9 @@ fn idoc_get_walks_paths_and_missing_paths_are_none() {
 }
 
 #[test]
-fn patterns_with_arrays_are_rejected() {
+fn empty_arrays_in_patterns_are_rejected() {
     assert!(matches!(
-        pattern_predicates(&serde_json::json!({"tags": ["a"]})),
+        pattern_predicates(&serde_json::json!({"tags": []})),
         Err(DatalogError::Type(_))
     ));
 }
