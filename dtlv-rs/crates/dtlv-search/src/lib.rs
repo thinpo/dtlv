@@ -2,6 +2,7 @@ pub mod fulltext;
 pub mod hnsw;
 pub mod stem;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use hnsw::Hnsw;
@@ -22,33 +23,73 @@ pub enum Metric {
 pub const BRUTE_FORCE_MAX: u64 = 512;
 /// Beam width for graph search (raised to `k` when `k` is larger).
 const EF_SEARCH: usize = 64;
+/// How many versions of vector writes are kept for incremental graph updates.
+const LOG_RETENTION: u64 = 4096;
 const VERSION_KEY: &[u8] = b"version";
+const OP_UPSERT: u8 = 0;
+const OP_REMOVE: u8 = 1;
+
+/// Counters for how searches kept the graph current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VectorStats {
+    /// Full graph builds.
+    pub rebuilds: u64,
+    /// Searches that brought the cached graph up to date by replaying logged writes.
+    pub incremental_updates: u64,
+}
 
 /// LMDB-persisted vector index for entity embeddings (entity resolution & semantic lookup).
 ///
-/// Vectors live in LMDB. Searches over more than `BRUTE_FORCE_MAX` vectors use an in-memory HNSW graph,
-/// which is rebuilt whenever the persisted version counter differs from the one it was built at. This
-/// keeps results consistent with aborts and older read snapshots. The cost is one rebuild after writes.
+/// Vectors live in LMDB. Each write also appends an operation to a log keyed by the index version. A search
+/// over more than `BRUTE_FORCE_MAX` vectors keeps a cached HNSW graph current by replaying the logged writes
+/// after the graph's version, reading only from its own snapshot. It rebuilds from scratch when the log no
+/// longer covers the gap or when too many nodes are tombstoned.
 pub struct VectorIndex {
     vectors: RawDb,
     meta: RawDb,
+    log: RawDb,
     metric: Metric,
     graph: Mutex<Option<(u64, Hnsw)>>,
+    rebuilds: AtomicU64,
+    incremental: AtomicU64,
 }
 
 impl VectorIndex {
     pub fn open(store: &KvStore, wtxn: &mut WriteTxn<'_>, name: &str, metric: Metric) -> Result<Self, KvError> {
         let vectors = store.open_db(wtxn, name)?;
         let meta = store.open_db(wtxn, &format!("{name}__meta"))?;
-        Ok(Self { vectors, meta, metric, graph: Mutex::new(None) })
+        let log = store.open_db(wtxn, &format!("{name}__log"))?;
+        Ok(Self {
+            vectors,
+            meta,
+            log,
+            metric,
+            graph: Mutex::new(None),
+            rebuilds: AtomicU64::new(0),
+            incremental: AtomicU64::new(0),
+        })
     }
 
-    fn bump_version(&self, wtxn: &mut WriteTxn<'_>) -> Result<(), KvError> {
+    pub fn stats(&self) -> VectorStats {
+        VectorStats {
+            rebuilds: self.rebuilds.load(Ordering::Relaxed),
+            incremental_updates: self.incremental.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Advances the version, records the operation under it, and drops entries past the retention window.
+    fn record(&self, wtxn: &mut WriteTxn<'_>, op: &[u8]) -> Result<(), KvError> {
         let cur = match self.meta.get_rw(wtxn, VERSION_KEY)? {
             Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
             _ => 0,
         };
-        self.meta.put(wtxn, VERSION_KEY, &(cur + 1).to_be_bytes())
+        let next = cur + 1;
+        self.meta.put(wtxn, VERSION_KEY, &next.to_be_bytes())?;
+        self.log.put(wtxn, &next.to_be_bytes(), op)?;
+        if next > LOG_RETENTION {
+            self.log.delete(wtxn, &(next - LOG_RETENTION).to_be_bytes())?;
+        }
+        Ok(())
     }
 
     pub fn add_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId, vec: &[f32]) -> Result<(), KvError> {
@@ -57,12 +98,20 @@ impl VectorIndex {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
         self.vectors.put(wtxn, &eid.to_be_bytes(), &bytes)?;
-        self.bump_version(wtxn)
+        let mut op = vec![OP_UPSERT];
+        op.extend_from_slice(&eid.to_be_bytes());
+        op.extend_from_slice(&bytes);
+        self.record(wtxn, &op)
     }
 
+    /// Removes the vector of `eid`. Removing an absent entity changes nothing and does not advance the version.
     pub fn remove_vec(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), KvError> {
-        self.vectors.delete(wtxn, &eid.to_be_bytes())?;
-        self.bump_version(wtxn)
+        if !self.vectors.delete(wtxn, &eid.to_be_bytes())? {
+            return Ok(());
+        }
+        let mut op = vec![OP_REMOVE];
+        op.extend_from_slice(&eid.to_be_bytes());
+        self.record(wtxn, &op)
     }
 
     pub fn dump_vecs(&self, rtxn: &ReadTxn<'_>) -> Result<Vec<(EntityId, Vec<f32>)>, KvError> {
@@ -83,6 +132,7 @@ impl VectorIndex {
     }
 
     /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer).
+    /// Returns top-k `(EntityId, distance)` sorted ascending (smaller = closer).
     /// Exact for small indexes; approximate (HNSW) above `BRUTE_FORCE_MAX` vectors.
     pub fn search_vec(
         &self,
@@ -101,11 +151,34 @@ impl VectorIndex {
             _ => 0,
         };
         let mut guard = self.graph.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.as_ref().map(|(v, _)| *v) != Some(version) {
+        let mut current = false;
+        if let Some((v0, graph)) = guard.as_mut() {
+            if *v0 == version {
+                current = true;
+            } else if version > *v0 && version - *v0 <= LOG_RETENTION {
+                let mut ops = Vec::with_capacity((version - *v0) as usize);
+                for v in (*v0 + 1)..=version {
+                    match self.log.get(rtxn, &v.to_be_bytes())? {
+                        Some(op) => ops.push(op.into_owned()),
+                        None => break,
+                    }
+                }
+                if ops.len() as u64 == version - *v0 {
+                    for op in &ops {
+                        apply_op(graph, op);
+                    }
+                    *v0 = version;
+                    self.incremental.fetch_add(1, Ordering::Relaxed);
+                    current = !graph.needs_compaction();
+                }
+            }
+        }
+        if !current {
             let items = self.dump_vecs(rtxn)?;
             *guard = Some((version, Hnsw::build(self.metric, items)));
+            self.rebuilds.fetch_add(1, Ordering::Relaxed);
         }
-        let graph = &guard.as_ref().expect("graph built above").1;
+        let graph = &guard.as_ref().expect("graph is current").1;
         Ok(graph.search(query, k, EF_SEARCH).into_iter().collect())
     }
 
@@ -159,6 +232,21 @@ impl VectorIndex {
         let mut out: Vec<(EntityId, f32)> = heap.into_iter().map(|h| (h.1, h.0)).collect();
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(out)
+    }
+}
+
+/// Replays one logged vector write onto the graph.
+fn apply_op(graph: &mut Hnsw, op: &[u8]) {
+    match op.first() {
+        Some(&OP_UPSERT) if op.len() >= 9 => {
+            let eid = u64::from_be_bytes(op[1..9].try_into().unwrap());
+            let vec: Vec<f32> = op[9..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            graph.upsert(eid, vec);
+        }
+        Some(&OP_REMOVE) if op.len() == 9 => {
+            graph.remove(u64::from_be_bytes(op[1..9].try_into().unwrap()));
+        }
+        _ => {}
     }
 }
 

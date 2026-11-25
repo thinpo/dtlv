@@ -4,7 +4,7 @@
 //! version changes. Levels come from a hash of the entity id, so builds are deterministic.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use dtlv_codec::EntityId;
 
@@ -40,6 +40,11 @@ pub struct Hnsw {
     links: Vec<Vec<Vec<u32>>>,
     entry: Option<u32>,
     max_level: usize,
+    /// `alive[node]` is false once the node has been removed or replaced (tombstone).
+    alive: Vec<bool>,
+    /// The live node for each entity.
+    slot: HashMap<EntityId, u32>,
+    dead: usize,
 }
 
 /// splitmix64 hash, mapped to a level with the usual `floor(-ln(u) / ln(M))` distribution.
@@ -57,11 +62,50 @@ impl Hnsw {
     /// Builds the graph, inserting entities in id order so the result does not depend on storage order.
     pub fn build(metric: Metric, mut items: Vec<(EntityId, Vec<f32>)>) -> Self {
         items.sort_by_key(|(eid, _)| *eid);
-        let mut g = Hnsw { metric, ids: Vec::new(), vecs: Vec::new(), links: Vec::new(), entry: None, max_level: 0 };
+        let mut g = Hnsw {
+            metric,
+            ids: Vec::new(),
+            vecs: Vec::new(),
+            links: Vec::new(),
+            entry: None,
+            max_level: 0,
+            alive: Vec::new(),
+            slot: HashMap::new(),
+            dead: 0,
+        };
         for (eid, vec) in items {
-            g.insert(eid, vec);
+            g.upsert(eid, vec);
         }
         g
+    }
+
+    /// Inserts or replaces the vector of `eid`. A replaced node stays in the graph as a tombstone.
+    pub fn upsert(&mut self, eid: EntityId, vec: Vec<f32>) {
+        if let Some(old) = self.slot.get(&eid).copied() {
+            self.alive[old as usize] = false;
+            self.dead += 1;
+        }
+        let node = self.ids.len() as u32;
+        self.insert(eid, vec);
+        self.alive.push(true);
+        self.slot.insert(eid, node);
+    }
+
+    /// Tombstones the vector of `eid`, if it has one.
+    pub fn remove(&mut self, eid: EntityId) {
+        if let Some(node) = self.slot.remove(&eid) {
+            self.alive[node as usize] = false;
+            self.dead += 1;
+        }
+    }
+
+    pub fn live_len(&self) -> usize {
+        self.slot.len()
+    }
+
+    /// Tombstones pile up until a rebuild is cheaper than searching past them.
+    pub fn needs_compaction(&self) -> bool {
+        self.dead > 1000 && self.dead > self.slot.len()
     }
 
     fn dist(&self, q: &[f32], node: u32) -> f32 {
@@ -179,9 +223,11 @@ impl Hnsw {
         for lc in (1..=self.max_level).rev() {
             ep = self.greedy(q, ep, lc);
         }
-        let ef = ef.max(k);
+        // Tombstones take slots in the beam, so widen it by the number of dead nodes.
+        let ef = ef.max(k) + self.dead.min(2000);
         self.search_layer(q, &[ep], ef, 0)
             .into_iter()
+            .filter(|&(_, n)| self.alive[n as usize])
             .take(k)
             .map(|(d, n)| (self.ids[n as usize], d))
             .collect()
