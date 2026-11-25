@@ -10,6 +10,9 @@ use dtlv_codec::EntityId;
 
 use crate::{compute_distance, Metric};
 
+/// Leading byte of the serialized form; bump it when the layout changes.
+const FORMAT_VERSION: u8 = 1;
+
 const M: usize = 16;
 const M_MAX0: usize = 2 * M;
 const EF_CONSTRUCTION: usize = 100;
@@ -58,7 +61,155 @@ fn level_for(eid: EntityId) -> usize {
     (-u.ln() * ml).floor() as usize
 }
 
+fn metric_tag(metric: Metric) -> u8 {
+    match metric {
+        Metric::Cosine => 0,
+        Metric::Euclidean => 1,
+        Metric::DotProduct => 2,
+    }
+}
+
+fn metric_from_tag(tag: u8) -> Option<Metric> {
+    match tag {
+        0 => Some(Metric::Cosine),
+        1 => Some(Metric::Euclidean),
+        2 => Some(Metric::DotProduct),
+        _ => None,
+    }
+}
+
+/// Bounds-checked little-endian reader for `Hnsw::from_bytes`.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// `count` little-endian u32 values.
+    fn u32s(&mut self, count: usize) -> Option<Vec<u32>> {
+        let raw = self.take(count.checked_mul(4)?)?;
+        Some(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+}
+
 impl Hnsw {
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Serializes the whole graph, tombstones included, so a reload searches exactly like the original.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![FORMAT_VERSION, metric_tag(self.metric)];
+        out.extend_from_slice(&(self.ids.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.entry.unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&(self.max_level as u32).to_le_bytes());
+        for node in 0..self.ids.len() {
+            out.extend_from_slice(&self.ids[node].to_le_bytes());
+            out.push(self.alive[node] as u8);
+            out.extend_from_slice(&(self.vecs[node].len() as u32).to_le_bytes());
+            for f in &self.vecs[node] {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            out.extend_from_slice(&(self.links[node].len() as u32).to_le_bytes());
+            for layer in &self.links[node] {
+                out.extend_from_slice(&(layer.len() as u32).to_le_bytes());
+                for nb in layer {
+                    out.extend_from_slice(&nb.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Inverse of `to_bytes`. Returns `None` for any malformed input, including a graph whose links would
+    /// index past a node's layers, so a corrupt cache is rebuilt instead of crashing a search.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Hnsw> {
+        let mut r = Reader { bytes, pos: 0 };
+        if r.u8()? != FORMAT_VERSION {
+            return None;
+        }
+        let metric = metric_from_tag(r.u8()?)?;
+        let n = r.u32()? as usize;
+        let entry = r.u32()?;
+        let max_level = r.u32()? as usize;
+        let mut ids = Vec::new();
+        let mut vecs = Vec::new();
+        let mut links = Vec::new();
+        let mut alive = Vec::new();
+        for _ in 0..n {
+            ids.push(r.u64()?);
+            alive.push(match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            });
+            let dim = r.u32()? as usize;
+            vecs.push(
+                r.take(dim.checked_mul(4)?)?
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect::<Vec<f32>>(),
+            );
+            let layer_count = r.u32()? as usize;
+            let mut node_links = Vec::new();
+            for _ in 0..layer_count {
+                let count = r.u32()? as usize;
+                node_links.push(r.u32s(count)?);
+            }
+            links.push(node_links);
+        }
+        if r.pos != bytes.len() {
+            return None;
+        }
+        let entry = match (n, entry) {
+            (0, u32::MAX) => None,
+            (_, e) if (e as usize) < n => Some(e),
+            _ => return None,
+        };
+        if let Some(e) = entry {
+            // Search walks layers 0..=max_level from the entry point.
+            if links[e as usize].len() <= max_level {
+                return None;
+            }
+        }
+        for node_links in &links {
+            for (lc, layer) in node_links.iter().enumerate() {
+                for &nb in layer {
+                    if nb as usize >= n || links[nb as usize].len() <= lc {
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut slot = HashMap::new();
+        for (node, &live) in alive.iter().enumerate() {
+            if live {
+                slot.insert(ids[node], node as u32);
+            }
+        }
+        let dead = alive.iter().filter(|&&a| !a).count();
+        Some(Hnsw { metric, ids, vecs, links, entry, max_level, alive, slot, dead })
+    }
+
     /// Builds the graph, inserting entities in id order so the result does not depend on storage order.
     pub fn build(metric: Metric, mut items: Vec<(EntityId, Vec<f32>)>) -> Self {
         items.sort_by_key(|(eid, _)| *eid);
@@ -232,4 +383,41 @@ impl Hnsw {
             .map(|(d, n)| (self.ids[n as usize], d))
             .collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    #[test]
+    fn bytes_round_trip_searches_identically_and_rejects_malformed_input() {
+        let mut rng = Lcg(99);
+        let items: Vec<(EntityId, Vec<f32>)> =
+            (1..=200u64).map(|e| (e, (0..8).map(|_| rng.next_f32()).collect())).collect();
+        let mut g = Hnsw::build(Metric::Euclidean, items);
+        g.remove(7);
+        g.upsert(3, (0..8).map(|_| rng.next_f32()).collect());
+        let bytes = g.to_bytes();
+        let back = Hnsw::from_bytes(&bytes).expect("round trip");
+        assert_eq!(back.metric(), Metric::Euclidean);
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..8).map(|_| rng.next_f32()).collect();
+            assert_eq!(g.search(&q, 10, EF_SEARCH_TEST), back.search(&q, 10, EF_SEARCH_TEST));
+        }
+        for len in [0, 1, 2, 10, bytes.len() / 2, bytes.len() - 1] {
+            assert!(Hnsw::from_bytes(&bytes[..len]).is_none(), "truncated at {len}");
+        }
+        assert!(Hnsw::from_bytes(&[]).is_none());
+    }
+
+    const EF_SEARCH_TEST: usize = 64;
 }

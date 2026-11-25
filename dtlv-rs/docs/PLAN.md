@@ -65,9 +65,10 @@ Known limits to keep: rules with `or`, `not`, or nested queries still fall back 
 
 ### 1.3 Smaller open items (in `PARITY.md`)
 
-- Vector index: persisted graph (today the graph is rebuilt from the log or vectors after restart), quantization,
-  and `vec-neighbors` as a query function.
-- Idoc: array values inside patterns (today patterns may not contain arrays).
+- Vector index: persisted graph done (`Conn::save_vector_graph`, explicit; loaded on the first large search after
+  restart and caught up from the log; ~160 KB per 1k dim-8 vectors). Open: quantization, `vec-neighbors` as a query
+  function, automatic saving.
+- Idoc: array values inside patterns done (containment semantics).
 - Transactions: `with` simulation and `:db/ensure`.
 - Schema: changing cardinality or uniqueness in place is done (`update_schema`, validated against existing data;
   tests `schema_change_test`). Attribute specs are not persisted, so callers must pass the new spec to `open`.

@@ -838,6 +838,15 @@ impl Conn {
         Ok(())
     }
 
+    /// Saves the cached vector graph so the next process's first large search skips the rebuild. Call it before
+    /// closing. A saved graph is ignored once it is older than the vector log retains.
+    pub fn save_vector_graph(&self) -> Result<bool, DatalogError> {
+        let mut wtxn = self.store.write_txn()?;
+        let saved = self.vec_idx.save_graph(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(saved)
+    }
+
     pub fn remove_vec(&self, eid: EntityId) -> Result<(), DatalogError> {
         let mut wtxn = self.store.write_txn()?;
         self.vec_idx.remove_vec(&mut wtxn, eid)?;

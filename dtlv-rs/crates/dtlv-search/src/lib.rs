@@ -26,6 +26,8 @@ const EF_SEARCH: usize = 64;
 /// How many versions of vector writes are kept for incremental graph updates.
 const LOG_RETENTION: u64 = 4096;
 const VERSION_KEY: &[u8] = b"version";
+const GRAPH_KEY: &[u8] = b"graph";
+const GRAPH_VERSION_KEY: &[u8] = b"graph_version";
 const OP_UPSERT: u8 = 0;
 const OP_REMOVE: u8 = 1;
 
@@ -36,6 +38,8 @@ pub struct VectorStats {
     pub rebuilds: u64,
     /// Searches that brought the cached graph up to date by replaying logged writes.
     pub incremental_updates: u64,
+    /// Graphs loaded from the copy saved by `save_graph`, instead of rebuilt.
+    pub loads: u64,
 }
 
 /// LMDB-persisted vector index for entity embeddings (entity resolution & semantic lookup).
@@ -52,6 +56,7 @@ pub struct VectorIndex {
     graph: Mutex<Option<(u64, Hnsw)>>,
     rebuilds: AtomicU64,
     incremental: AtomicU64,
+    loads: AtomicU64,
 }
 
 impl VectorIndex {
@@ -67,6 +72,7 @@ impl VectorIndex {
             graph: Mutex::new(None),
             rebuilds: AtomicU64::new(0),
             incremental: AtomicU64::new(0),
+            loads: AtomicU64::new(0),
         })
     }
 
@@ -74,7 +80,39 @@ impl VectorIndex {
         VectorStats {
             rebuilds: self.rebuilds.load(Ordering::Relaxed),
             incremental_updates: self.incremental.load(Ordering::Relaxed),
+            loads: self.loads.load(Ordering::Relaxed),
         }
+    }
+
+    /// Writes the cached graph and its version into `meta`, so a later process can skip the rebuild.
+    /// Returns `false` and writes nothing when no graph is cached yet.
+    pub fn save_graph(&self, wtxn: &mut WriteTxn<'_>) -> Result<bool, KvError> {
+        let guard = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((version, graph)) = guard.as_ref() else {
+            return Ok(false);
+        };
+        self.meta.put(wtxn, GRAPH_KEY, &graph.to_bytes())?;
+        self.meta.put(wtxn, GRAPH_VERSION_KEY, &version.to_be_bytes())?;
+        Ok(true)
+    }
+
+    /// Loads the graph saved by `save_graph` if it is intact, uses this index's metric, and is not newer than
+    /// `version`. Catch-up in `search_vec` decides whether it is still usable.
+    fn load_graph(&self, rtxn: &ReadTxn<'_>, version: u64) -> Result<Option<(u64, Hnsw)>, KvError> {
+        let (Some(v), Some(bytes)) = (self.meta.get(rtxn, GRAPH_VERSION_KEY)?, self.meta.get(rtxn, GRAPH_KEY)?)
+        else {
+            return Ok(None);
+        };
+        if v.len() != 8 {
+            return Ok(None);
+        }
+        let graph_version = u64::from_be_bytes(v.as_ref().try_into().unwrap());
+        if graph_version > version {
+            return Ok(None);
+        }
+        Ok(Hnsw::from_bytes(&bytes)
+            .filter(|g| g.metric() == self.metric)
+            .map(|g| (graph_version, g)))
     }
 
     /// Advances the version, records the operation under it, and drops entries past the retention window.
@@ -151,6 +189,12 @@ impl VectorIndex {
             _ => 0,
         };
         let mut guard = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            if let Some(loaded) = self.load_graph(rtxn, version)? {
+                *guard = Some(loaded);
+                self.loads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut current = false;
         if let Some((v0, graph)) = guard.as_mut() {
             if *v0 == version {
