@@ -210,8 +210,17 @@ impl Conn {
         let mut leaves = Vec::new();
         collect_leaves(&doc, &mut Vec::new(), &mut leaves);
         let spec = self.attrs.get(&aid);
-        let indexed = spec.and_then(|s| s.indexed_paths.as_deref());
-        let excluded: &[Vec<PathSeg>] = spec.map(|s| s.excluded_paths.as_slice()).unwrap_or(&[]);
+        // An attribute's own selectors win; otherwise its named domain's apply.
+        let domain = spec.and_then(|s| s.idoc_domain.as_deref()).and_then(|d| self.idoc_domains.get(d));
+        let (indexed, excluded): (Option<&[Vec<PathSeg>]>, &[Vec<PathSeg>]) = match spec {
+            Some(s) if s.indexed_paths.is_some() || !s.excluded_paths.is_empty() => {
+                (s.indexed_paths.as_deref(), s.excluded_paths.as_slice())
+            }
+            _ => match domain {
+                Some(d) => (d.indexed.as_deref(), d.excluded.as_slice()),
+                None => (None, &[]),
+            },
+        };
         let mut keys = Vec::new();
         for (segs, val) in &leaves {
             let in_scope = indexed.is_none_or(|sels| sels.iter().any(|sel| selector_matches(sel, segs)));

@@ -54,7 +54,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Idoc | `:db.fn/patchIdoc` on cardinality-many attributes (the old document identifies the target) | done |
 | Idoc | EDN input (`idoc_value_edn`; keyword values, lists, and sets are rejected) | done |
 | Idoc | `indexed-paths` and `excluded-paths` per attribute (excluded wins; selectors without positions cover array elements) | done |
-| Idoc | Markdown format, named domains (shared across attributes), async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
+| Idoc | named domains: `Conn::set_idoc_domain` shares selectors across attributes that name the domain (set before indexing; not persisted) | done |
+| Idoc | Markdown format, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
 | Codecs | nippy, bits, zstd dictionary compression, CSV, Hu-Tucker keys, roaring | todo (in `datalevin/src/rust`) |
 
 ## Behavioral notes

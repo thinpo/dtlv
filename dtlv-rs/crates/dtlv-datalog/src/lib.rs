@@ -56,6 +56,8 @@ pub struct AttrSpec {
     pub indexed_paths: Option<Vec<Vec<PathSeg>>>,
     /// Idoc path selectors to omit. Excluded paths win over indexed ones.
     pub excluded_paths: Vec<Vec<PathSeg>>,
+    /// Named idoc domain whose selectors apply when this attribute sets none of its own.
+    pub idoc_domain: Option<String>,
 }
 
 impl AttrSpec {
@@ -71,6 +73,7 @@ impl AttrSpec {
             idoc: false,
             indexed_paths: None,
             excluded_paths: Vec::new(),
+            idoc_domain: None,
         }
     }
 
@@ -83,6 +86,13 @@ impl AttrSpec {
     /// Restricts idoc indexing to paths under these selectors (`:db.idoc/indexedPaths`).
     pub fn idoc_indexed_paths(mut self, paths: Vec<Vec<PathSeg>>) -> Self {
         self.indexed_paths = Some(paths);
+        self
+    }
+
+    /// Puts this attribute in a named idoc domain. Its selectors come from `Conn::set_idoc_domain` unless
+    /// the attribute sets its own.
+    pub fn idoc_domain(mut self, name: &str) -> Self {
+        self.idoc_domain = Some(name.to_owned());
         self
     }
 
@@ -251,6 +261,13 @@ impl TxView<'_, '_> {
 }
 
 /// A user function callable from query clauses: `[(name ?x ...) ?out]`. `None` is nil.
+/// Path selectors of a named idoc domain.
+#[derive(Debug, Clone, Default)]
+pub struct IdocDomain {
+    pub indexed: Option<Vec<Vec<PathSeg>>>,
+    pub excluded: Vec<Vec<PathSeg>>,
+}
+
 pub type QueryFn = Box<dyn Fn(&[Value]) -> Result<Option<Value>, DatalogError>>;
 
 pub type TxFn = Box<dyn Fn(&TxView<'_, '_>, &[Value]) -> Result<Vec<TxItem>, DatalogError>>;
@@ -355,6 +372,7 @@ pub struct Conn {
     wal: std::sync::Mutex<Option<wal::Wal>>,
     listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
     query_fns: HashMap<String, QueryFn>,
+    idoc_domains: HashMap<String, IdocDomain>,
 }
 
 impl Conn {
@@ -480,6 +498,7 @@ impl Conn {
             wal: std::sync::Mutex::new(None),
             listeners: Vec::new(),
             query_fns: HashMap::new(),
+            idoc_domains: HashMap::new(),
         })
     }
 
@@ -1458,6 +1477,19 @@ impl Conn {
             return Ok(Some(decode_value(&k[12..])?));
         }
         Ok(None)
+    }
+
+    /// Sets the path selectors of a named idoc domain (`indexed` is `None` to index every path). Domains are
+    /// not persisted: re-apply them on open, as with the schema. Refused once documents are indexed, since the
+    /// index would no longer match the selectors.
+    pub fn set_idoc_domain(&mut self, name: &str, indexed: Option<Vec<Vec<PathSeg>>>, excluded: Vec<Vec<PathSeg>>) -> Result<(), DatalogError> {
+        let rtxn = self.store.read_txn()?;
+        if self.idoc_idx.iter(&rtxn)?.next().is_some() {
+            return Err(DatalogError::Type("idoc domains must be set before documents are indexed".into()));
+        }
+        drop(rtxn);
+        self.idoc_domains.insert(name.to_owned(), IdocDomain { indexed, excluded });
+        Ok(())
     }
 
     /// Registers a function callable from query clauses by name, e.g. `[(double ?n) ?d]`.
