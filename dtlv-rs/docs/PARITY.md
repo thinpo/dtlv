@@ -22,7 +22,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are naive fixpoint) |
 | Query | cost-based ordering of datom clauses (greedy, index-aware), `explain` (access path and estimate per clause), `analyze` (rows and time per clause); no join algorithms or statistics beyond AVE counts | partial |
 | Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
-| Query | nested queries, UDFs | todo |
+| Query | nested queries `[(q [:find ...] $ args...) [[?a ?b]]]` (positional binding, correlated per outer binding, constant ones run once; nested queries do not see outer rules) | done |
+| Query | UDFs in queries (`query-apply` / `udf` registry) | todo |
 | Entity API | `rseek_datoms`, `search_datoms`, `fulltext_datoms`, `cardinality`, `max_eid` | done |
 | Entity API | read-only `entity` views: `get`, `touch`, `entity_by_lookup` (cardinality-many as tuples) | done |
 | Entity API | transactable entities: `assoc` and `dissoc` build transaction items | done |

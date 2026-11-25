@@ -302,6 +302,9 @@ pub enum Clause {
     RuleCall(String, Vec<ExprTerm>),
     /// Built-in function call: `[(get-else $ ?e :a 0) ?v]` or `[(missing? $ ?e :a)]`.
     Fn(String, Vec<ExprTerm>, FnOut),
+    /// `[(q [:find ...] $ args...) [[?a ?b]]]`: a nested query whose result columns bind positionally to
+    /// the output variables (`None` for `_`). Its `:in` inputs are the args, in order.
+    Nested(Box<ParsedQuery>, Vec<ExprTerm>, Vec<Option<String>>),
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +417,40 @@ fn edn_to_fts(edn: &Edn) -> Result<FtsQuery, ParseError> {
         }
         other => Err(ParseError::InvalidQuery(format!("invalid full-text query: {other:?}"))),
     }
+}
+
+/// `[(q <query> $ args...) <out>]`. Output is a relation `[[?a ?b ...]]`, or a single-column collection `[?a ...]`.
+fn parse_nested(inner: &[Edn], items: &[Edn]) -> Result<Clause, ParseError> {
+    let query = inner.get(1).ok_or_else(|| ParseError::InvalidQuery("q needs a query".into()))?;
+    let args: Vec<ExprTerm> = inner[2..]
+        .iter()
+        .filter(|e| !matches!(e, Edn::Symbol(s) if s == "$"))
+        .map(|e| edn_to_term(e, None))
+        .collect::<Result<_, _>>()?;
+    let var_or_none = |e: &Edn| match e {
+        Edn::Symbol(s) if s == "_" => Ok(None),
+        Edn::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
+        _ => Err(ParseError::InvalidQuery("nested query output must be ?vars or _".into())),
+    };
+    let out: Vec<Option<String>> = match items.get(1) {
+        Some(Edn::Vec(rows)) if rows.len() == 1 => match &rows[0] {
+            Edn::Vec(cols) => cols.iter().map(var_or_none).collect::<Result<_, _>>()?,
+            _ => return Err(ParseError::InvalidQuery("nested query output must be [[?a ?b]]".into())),
+        },
+        Some(Edn::Vec(cols)) if cols.len() == 2 && matches!(cols[1], Edn::Symbol(ref s) if s == "...") => {
+            vec![var_or_none(&cols[0])?]
+        }
+        _ => return Err(ParseError::InvalidQuery("nested query output must be [[?a ?b]] or [?a ...]".into())),
+    };
+    let parsed = parse_query_edn(query.clone(), None)?;
+    if parsed.find.len() != out.len() {
+        return Err(ParseError::InvalidQuery(format!(
+            "nested query returns {} columns but {} outputs are bound",
+            parsed.find.len(),
+            out.len()
+        )));
+    }
+    Ok(Clause::Nested(Box::new(parsed), args, out))
 }
 
 /// `[(idoc-match $ [:attr] {pattern}) [[?e ?a ?v]]]`.
@@ -564,6 +601,9 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                     return Err(ParseError::InvalidQuery("empty expression list".into()));
                 }
                 if let Edn::Symbol(op) = &inner[0] {
+                    if op == "q" {
+                        return parse_nested(inner, items);
+                    }
                     if op == "idoc-match" {
                         return parse_idoc_match(inner, items, in_map);
                     }
@@ -829,6 +869,10 @@ fn parse_find_items(items: &[Edn], find: &mut Vec<FindElem>, find_spec: &mut Fin
 
 fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<ParsedQuery, ParseError> {
     let edn = parse_edn(input)?;
+    parse_query_edn(edn, inputs)
+}
+
+fn parse_query_edn(edn: Edn, inputs: Option<&[QueryInput]>) -> Result<ParsedQuery, ParseError> {
     let mut find = Vec::new();
     let mut find_spec = FindSpec::Rel;
     let mut in_bindings: Vec<InBinding> = Vec::new();

@@ -1771,6 +1771,21 @@ impl Conn {
         self.finalize_query_result(rtxn, &parsed, envs)
     }
 
+    /// Runs a nested query on its own bindings and returns its rows.
+    fn run_nested(&self, rtxn: &ReadTxn<'_>, query: &ParsedQuery, inputs: Vec<QueryInput>) -> Result<Vec<Vec<Value>>, DatalogError> {
+        let seed = seed_envs(&query.in_bindings, &inputs)?;
+        let envs = self.eval_clauses(rtxn, &query.clauses, seed, &HashMap::new())?;
+        Ok(match self.finalize_query_result(rtxn, query, envs)? {
+            QueryResult::Rel(rows) => rows,
+            QueryResult::Coll(vals) => vals.into_iter().map(|v| vec![v]).collect(),
+            QueryResult::Scalar(v) => v.into_iter().map(|v| vec![v]).collect(),
+            QueryResult::Tuple(t) => t.into_iter().collect(),
+            QueryResult::Maps(_) | QueryResult::PulledColl(_) => {
+                return Err(DatalogError::Function("nested queries must return plain values".into()))
+            }
+        })
+    }
+
     fn finalize_query_result(
         &self,
         rtxn: &ReadTxn<'_>,
@@ -2139,6 +2154,40 @@ impl Conn {
                         for &(eid, _) in &hits {
                             let mut e2 = env.clone();
                             if bind_var(&mut e2, e_var, Value::Ref(eid)) {
+                                next_envs.push(e2);
+                            }
+                        }
+                    }
+                }
+                Clause::Nested(query, args, out) => {
+                    // Uncorrelated (constant) arguments run the nested query once, not once per environment.
+                    let uncorrelated = args.iter().all(|a| matches!(a, ExprTerm::Val(_)));
+                    let mut shared: Option<Vec<Vec<Value>>> = None;
+                    for env in &envs {
+                        let rows = match (&shared, uncorrelated) {
+                            (Some(rows), true) => rows.clone(),
+                            _ => {
+                                let mut inputs = Vec::with_capacity(args.len());
+                                for a in args {
+                                    match resolve_term(env, a) {
+                                        Some(v) => inputs.push(QueryInput::Scalar(v.clone())),
+                                        None => return Err(DatalogError::UnboundVar(format!("{a:?}"))),
+                                    }
+                                }
+                                let rows = self.run_nested(rtxn, query, inputs)?;
+                                if uncorrelated {
+                                    shared = Some(rows.clone());
+                                }
+                                rows
+                            }
+                        };
+                        for row in rows {
+                            let mut e2 = env.clone();
+                            let ok = out.iter().zip(row).all(|(var, val)| match var {
+                                Some(v) => bind_var(&mut e2, v, val),
+                                None => true,
+                            });
+                            if ok {
                                 next_envs.push(e2);
                             }
                         }

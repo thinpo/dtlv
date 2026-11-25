@@ -123,6 +123,14 @@ fn clause_vars(c: &Clause, out: &mut HashSet<String>) {
                 term_vars(a, out);
             }
         }
+        Clause::Nested(_, args, outs) => {
+            for a in args {
+                term_vars(a, out);
+            }
+            for v in outs.iter().flatten() {
+                out.insert(v.clone());
+            }
+        }
     }
 }
 
