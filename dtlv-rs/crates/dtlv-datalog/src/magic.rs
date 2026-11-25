@@ -81,6 +81,15 @@ pub fn rewrite(rule_map: &HashMap<String, Vec<RuleDef>>, goal: &str, args: &[Exp
     });
 
     while let Some((pred, a)) = queue.pop_front() {
+        // Every adorned rule's body starts with its magic guard. With no bound arguments the guard is the
+        // zero-argument predicate, which holds exactly one (empty) tuple.
+        if !a.iter().any(|&b| b) {
+            out.entry(magic(&pred, &a)).or_default().push(RuleDef {
+                name: magic(&pred, &a),
+                params: Vec::new(),
+                body: Vec::new(),
+            });
+        }
         for def in rule_map.get(&pred)? {
             if !conjunctive(&def.body) {
                 return None;

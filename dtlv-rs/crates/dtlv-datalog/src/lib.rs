@@ -2320,18 +2320,16 @@ impl Conn {
                                     if attr_hash.is_none() {
                                         let mut map: HashMap<Vec<u8>, Vec<EntityId>> = HashMap::new();
                                         for (eid, val) in attr_rows.as_deref().unwrap_or_default() {
-                                            let mut key = Vec::new();
-                                            encode_value(val, &mut key);
-                                            map.entry(key).or_default().push(*eid);
+                                            if let Some(key) = probe_key(val) {
+                                                map.entry(key).or_default().push(*eid);
+                                            }
                                         }
                                         attr_hash = Some(map);
                                     }
-                                    let mut key = Vec::new();
-                                    encode_value(bv, &mut key);
-                                    let eids: Vec<EntityId> = attr_hash
-                                        .as_ref()
-                                        .and_then(|m| m.get(&key).cloned())
-                                        .unwrap_or_default();
+                                    let eids: Vec<EntityId> = match probe_key(bv) {
+                                        Some(key) => attr_hash.as_ref().and_then(|m| m.get(&key).cloned()).unwrap_or_default(),
+                                        None => Vec::new(),
+                                    };
                                     for eid in eids {
                                         if let Some(e2) = bind_datom(env, e_term, v_term, eid, bv) {
                                             next_envs.push(e2);
@@ -2602,6 +2600,19 @@ fn fts_key(eid: EntityId, aid: AttrId, val: &Value) -> Vec<u8> {
     key.extend_from_slice(&aid.to_be_bytes());
     encode_value(val, &mut key);
     key
+}
+
+/// Hash key for a value under `Value` equality. `-0.0` and `0.0` are equal, so they share a key; `NaN` equals
+/// nothing, so it has none.
+fn probe_key(v: &Value) -> Option<Vec<u8>> {
+    let canonical = match v {
+        Value::F64(x) if x.is_nan() => return None,
+        Value::F64(x) if *x == 0.0 => Value::F64(0.0),
+        other => other.clone(),
+    };
+    let mut key = Vec::new();
+    encode_value(&canonical, &mut key);
+    Some(key)
 }
 
 /// Extends `env` with one matching datom `(eid, val)` for the pattern `[e_term a v_term]`, or `None` if the
