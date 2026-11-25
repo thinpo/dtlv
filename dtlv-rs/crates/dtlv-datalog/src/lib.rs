@@ -423,6 +423,8 @@ pub struct Conn {
     idoc_idx: RawDb,
     idoc_jobs: RawDb,
     wal: std::sync::Mutex<Option<wal::Wal>>,
+    /// Log size that triggers an automatic checkpoint after a committed write (0 = off).
+    wal_checkpoint_bytes: std::sync::atomic::AtomicU64,
     listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
     query_fns: HashMap<String, QueryFn>,
     idoc_domains: HashMap<String, IdocDomain>,
@@ -552,6 +554,7 @@ impl Conn {
             idoc_idx,
             idoc_jobs,
             wal: std::sync::Mutex::new(None),
+            wal_checkpoint_bytes: std::sync::atomic::AtomicU64::new(0),
             listeners: Vec::new(),
             query_fns: HashMap::new(),
             idoc_domains: HashMap::new(),
@@ -1219,6 +1222,16 @@ impl Conn {
                 f(&report);
             }
         }
+        // Checkpoint after listeners are notified. The transaction is already committed, so a failed
+        // checkpoint returns an error but does not roll it back.
+        if logged_lsn.is_some() {
+            let threshold = self.wal_checkpoint_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(wal) = wal_guard.as_mut().and_then(|g| g.as_mut()) {
+                if threshold > 0 && wal.len()? >= threshold {
+                    self.checkpoint_locked(wal)?;
+                }
+            }
+        }
         Ok(st.touched)
     }
 
@@ -1267,9 +1280,22 @@ impl Conn {
     /// Makes the store durable, then drops the log, which is no longer needed for recovery.
     pub fn checkpoint(&self) -> Result<(), DatalogError> {
         if let Some(log) = self.wal.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            self.store.sync()?;
-            log.truncate()?;
+            self.checkpoint_locked(log)?;
         }
+        Ok(())
+    }
+
+    /// After a committed transaction leaves the log at or above `bytes`, the connection checkpoints
+    /// (syncs the store, then truncates the log). `None` turns this off, which is the default. If the
+    /// checkpoint fails, the transaction stays committed and `run_tx` returns the error.
+    pub fn set_wal_checkpoint_bytes(&self, bytes: Option<u64>) {
+        self.wal_checkpoint_bytes.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Store sync then log truncate. The caller holds the WAL mutex, so `run_tx` can call it too.
+    fn checkpoint_locked(&self, wal: &mut wal::Wal) -> Result<(), DatalogError> {
+        self.store.sync()?;
+        wal.truncate()?;
         Ok(())
     }
 

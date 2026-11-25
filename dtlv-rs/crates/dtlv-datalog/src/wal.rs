@@ -489,6 +489,11 @@ impl Wal {
         self.file.sync_data().map_err(|e| crate::DatalogError::Wal(e.to_string()))
     }
 
+    /// Current size of the log file in bytes.
+    pub fn len(&self) -> Result<u64, crate::DatalogError> {
+        self.file.metadata().map(|m| m.len()).map_err(|e| crate::DatalogError::Wal(e.to_string()))
+    }
+
     /// Drops all records. Call only after the data they describe is durable in the store.
     pub fn truncate(&mut self) -> Result<(), crate::DatalogError> {
         self.file
@@ -693,5 +698,73 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].0, lsn);
         assert_eq!(format!("{:?}", recs[0].1), format!("{:?}", items));
+    }
+
+    fn log_len(dir: &std::path::Path) -> u64 {
+        std::fs::metadata(dir.join("wal.log")).unwrap().len()
+    }
+
+    #[test]
+    fn without_a_threshold_the_log_grows_and_is_never_truncated() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        let mut last = 0;
+        for i in 0..50 {
+            conn.transact(&[TxItem::Assert(None, vec![name(&format!("t{i}"))])]).unwrap();
+            let len = log_len(dir.path());
+            assert!(len > last, "log did not grow at tx {i}: {len} <= {last}");
+            last = len;
+        }
+    }
+
+    #[test]
+    fn automatic_checkpoints_keep_the_log_bounded_and_lose_no_data() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let threshold = 4096;
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        conn.set_wal_checkpoint_bytes(Some(threshold));
+        conn.transact(&[TxItem::Assert(None, vec![name("t0")])]).unwrap();
+        let record = log_len(dir.path());
+        let mut truncated = false;
+        let mut prev = record;
+        for i in 1..200 {
+            conn.transact(&[TxItem::Assert(None, vec![name(&format!("t{i}"))])]).unwrap();
+            let len = log_len(dir.path());
+            assert!(len < threshold + record, "log grew past threshold at tx {i}: {len}");
+            truncated |= len < prev;
+            prev = len;
+        }
+        assert!(truncated, "no automatic checkpoint happened");
+        let last_lsn = conn.applied_lsn().unwrap();
+        drop(conn);
+
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        assert_eq!(count_entities(&conn), 200);
+        conn.transact(&[TxItem::Assert(None, vec![name("after")])]).unwrap();
+        assert!(conn.applied_lsn().unwrap() > last_lsn, "lsn reused after automatic checkpoint");
+    }
+
+    #[test]
+    fn open_wal_replay_never_truncates_the_log() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let log_path = dir.path().join("wal.log");
+        {
+            let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+            conn.transact(&[TxItem::Assert(None, vec![name("A")])]).unwrap();
+            conn.transact(&[TxItem::Assert(None, vec![name("B")])]).unwrap();
+        }
+        // A logged transaction the store never applied, so open must replay it.
+        let (mut log, _) = Wal::open(&log_path, Durability::Strict, 1).unwrap();
+        log.append(&[TxItem::Assert(None, vec![name("C")])]).unwrap();
+        drop(log);
+        let before = log_len(dir.path());
+
+        let conn = Conn::open_wal(&db, dir.path(), schema(), Durability::Strict).unwrap();
+        assert_eq!(log_len(dir.path()), before, "replay truncated the log");
+        assert_eq!(read_records(&log_path).unwrap().len(), 3);
+        assert_eq!(count_entities(&conn), 3);
     }
 }
