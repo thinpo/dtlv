@@ -280,3 +280,32 @@ fn or_join_keeps_only_outer_and_join_vars() {
     r.sort_by_key(|row| format!("{row:?}"));
     assert_eq!(r, vec![vec![s("Ann"), s("A")], vec![s("Ann"), s("x")], vec![s("Bob"), s("x")]]);
 }
+
+#[test]
+fn get_some_else_returns_default_when_no_attribute_present() {
+    let conn = conn();
+    let rtxn = conn.read_txn().unwrap();
+    let mut r = rows(
+        conn.q_str(
+            &rtxn,
+            r#"[:find ?name ?v :where [?e :person/name ?name]
+                [(get-some-else $ ?e "N/A" :person/nick :person/age) [_ ?v]]]"#,
+            &[],
+        )
+        .unwrap(),
+    );
+    r.sort_by_key(|row| format!("{row:?}"));
+    // Ann has a nick, so the nick wins; Bob has no nick, so the age is used.
+    assert_eq!(r, vec![vec![s("Ann"), s("A")], vec![s("Bob"), Value::I64(7)]]);
+
+    let r = rows(
+        conn.q_str(
+            &rtxn,
+            r#"[:find ?v :where [?e :person/name "Bob"]
+                [(get-some-else $ ?e "N/A" :person/nick) [_ ?v]]]"#,
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(r, vec![vec![s("N/A")]]);
+}

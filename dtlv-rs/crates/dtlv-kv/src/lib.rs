@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
-use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
@@ -26,6 +26,8 @@ pub enum KvError {
     InvalidTableName(String),
     #[error("malformed list item key")]
     InvalidListItem,
+    #[error("operation not supported by this backend: {0}")]
+    Unsupported(&'static str),
     #[error("{0}")]
     Config(String),
 }
@@ -835,6 +837,98 @@ impl KvStore {
 
     pub fn entries(&self, rtxn: &ReadTxn<'_>, db: &RawDb) -> Result<u64, KvError> {
         db.len(rtxn)
+    }
+
+    /// Names of the named DBIs/tables in this store.
+    pub fn list_dbis(&self) -> Result<Vec<String>, KvError> {
+        Ok(match self {
+            KvStore::Lmdb { env } => {
+                let rtxn = env.read_txn()?;
+                let mut names = Vec::new();
+                if let Some(root) = env.open_database::<Bytes, Bytes>(&rtxn, None)? {
+                    for item in root.iter(&rtxn)? {
+                        let (k, _) = item?;
+                        names.push(String::from_utf8_lossy(k).into_owned());
+                    }
+                }
+                names
+            }
+            KvStore::Sqlite { conn } => {
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )?;
+                // Tables are stored as `kv_<name>`; report the caller's name.
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                names.into_iter().filter_map(|n| n.strip_prefix("kv_").map(str::to_owned)).collect()
+            }
+            KvStore::Redb { db } => {
+                let rtxn = db.begin_read()?;
+                rtxn.list_tables()?.map(|h| h.name().to_string()).collect()
+            }
+            KvStore::Mem { tables, .. } => tables.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
+        })
+    }
+
+    /// Removes a named DBI/table, returning whether it existed. On LMDB the database is emptied but its
+    /// name stays in the environment's directory, because the pinned `heed` cannot delete named databases.
+    pub fn drop_dbi(&self, name: &str) -> Result<bool, KvError> {
+        match self {
+            KvStore::Lmdb { env } => {
+                let rtxn = env.read_txn()?;
+                let db = env.open_database::<Bytes, Bytes>(&rtxn, Some(name))?;
+                drop(rtxn);
+                let Some(db) = db else { return Ok(false) };
+                let mut wtxn = env.write_txn()?;
+                db.clear(&mut wtxn)?;
+                wtxn.commit()?;
+                Ok(true)
+            }
+            KvStore::Sqlite { conn } => {
+                let table = validate_table_name(name)?;
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let exists: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [&table],
+                    |r| r.get(0),
+                )?;
+                if exists == 0 {
+                    return Ok(false);
+                }
+                conn.execute_batch(&format!("DROP TABLE \"{}\"", table))?;
+                Ok(true)
+            }
+            KvStore::Redb { db } => {
+                let wtxn = db.begin_write()?;
+                let def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
+                let existed = wtxn.delete_table(def)?;
+                wtxn.commit()?;
+                Ok(existed)
+            }
+            KvStore::Mem { tables, writer } => {
+                let _w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(tables.write().unwrap_or_else(|e| e.into_inner()).remove(name).is_some())
+            }
+        }
+    }
+
+    /// Writes a consistent copy of the store to `path`. LMDB and SQLite only.
+    pub fn copy_to(&self, path: &Path) -> Result<(), KvError> {
+        match self {
+            KvStore::Lmdb { env } => {
+                env.copy_to_file(path, heed::CompactionOption::Disabled)?;
+                Ok(())
+            }
+            KvStore::Sqlite { conn } => {
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+                Ok(())
+            }
+            KvStore::Redb { .. } => Err(KvError::Unsupported("copy_to on redb")),
+            KvStore::Mem { .. } => Err(KvError::Unsupported("copy_to on the in-memory store")),
+        }
     }
 }
 

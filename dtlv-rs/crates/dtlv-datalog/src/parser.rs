@@ -225,8 +225,9 @@ pub enum CmpOp {
     Gt,
     Eq,
     Ne,
-    Like,
-    NotLike,
+    /// Carries the escape character (`!` unless `{:escape "c"}` is given).
+    Like(char),
+    NotLike(char),
 }
 
 /// Output binding of a function clause: `[(f ...) ?x]`, `[(f ...) [?a ?b]]`, or a bare filter `[(f ...)]`.
@@ -354,6 +355,38 @@ fn edn_to_term(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Exp
     }
 }
 
+/// Datalevin's LIKE escape character when none is given.
+pub const DEFAULT_ESCAPE: char = '!';
+
+/// Pattern check shared with the matcher: an escape must precede `%`, `_`, or itself.
+pub fn like_pattern_valid(pattern: &str, escape: char) -> bool {
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == escape {
+            match chars.next() {
+                None => {}
+                Some(n) if n == '%' || n == '_' || n == escape => {}
+                Some(_) => return false,
+            }
+        }
+    }
+    true
+}
+
+fn parse_escape(opts: &Edn) -> Result<char, ParseError> {
+    if let Edn::Map(pairs) = opts {
+        if let [(Edn::Keyword(k), Edn::Str(v))] = pairs.as_slice() {
+            if k == ":escape" {
+                let mut it = v.chars();
+                if let (Some(c), None) = (it.next(), it.next()) {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+    Err(ParseError::InvalidQuery("like options must be {:escape \"c\"}".into()))
+}
+
 /// Converts a full-text query literal: a string, `{:phrase "..."}`, `{:term "..."}`, or `[:and|:or|:not ...]`.
 fn edn_to_fts(edn: &Edn) -> Result<FtsQuery, ParseError> {
     match edn {
@@ -440,7 +473,7 @@ fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String,
         _ => return Err(ParseError::InvalidQuery("function name must be a symbol".into())),
     };
     const KNOWN_FNS: &[&str] = &[
-        "get-else", "get-some", "missing?", "ground", "tuple", "untuple", "in", "not-in", "inc", "dec", "+", "-",
+        "get-else", "get-some", "get-some-else", "missing?", "ground", "tuple", "untuple", "in", "not-in", "inc", "dec", "+", "-",
         "*", "/", "quot", "rem", "mod",
     ];
     if !KNOWN_FNS.contains(&name.as_str()) {
@@ -461,9 +494,12 @@ fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String,
         Some(Edn::Symbol(s)) if s.starts_with('?') => FnOut::Var(s.clone()),
         Some(Edn::Vec(vs)) => FnOut::Tuple(
             vs.iter()
-                .map(|v| match v {
+                .enumerate()
+                .map(|(i, v)| match v {
                     Edn::Symbol(s) if s.starts_with('?') => Ok(s.clone()),
-                    _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars".into())),
+                    // `_` binds to a throwaway variable that no clause reads.
+                    Edn::Symbol(s) if s == "_" => Ok(format!("?_ignored{i}")),
+                    _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars or _".into())),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
@@ -570,15 +606,26 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                         ">" => CmpOp::Gt,
                         "=" => CmpOp::Eq,
                         "!=" | "not=" => CmpOp::Ne,
-                        "like" => CmpOp::Like,
-                        "not-like" => CmpOp::NotLike,
+                        "like" => CmpOp::Like(DEFAULT_ESCAPE),
+                        "not-like" => CmpOp::NotLike(DEFAULT_ESCAPE),
                         _ => return parse_fn_clause(inner, items, in_map),
                     };
-                    if inner.len() != 3 {
+                    // `like` and `not-like` take an optional {:escape "c"} options map.
+                    let (cmp, expected_args) = match (cmp, inner.get(3)) {
+                        (CmpOp::Like(_), Some(opts)) => (CmpOp::Like(parse_escape(opts)?), 4),
+                        (CmpOp::NotLike(_), Some(opts)) => (CmpOp::NotLike(parse_escape(opts)?), 4),
+                        _ => (cmp, 3),
+                    };
+                    if inner.len() != expected_args {
                         return Err(ParseError::InvalidQuery("predicate requires 2 args".into()));
                     }
                     let lhs = edn_to_term(&inner[1], in_map)?;
                     let rhs = edn_to_term(&inner[2], in_map)?;
+                    if let (CmpOp::Like(esc) | CmpOp::NotLike(esc), ExprTerm::Val(Value::Str(pat))) = (cmp, &rhs) {
+                        if !like_pattern_valid(pat, esc) {
+                            return Err(ParseError::InvalidQuery(format!("invalid like pattern: {pat}")));
+                        }
+                    }
                     return Ok(Clause::Pred(cmp, lhs, rhs));
                 }
             }

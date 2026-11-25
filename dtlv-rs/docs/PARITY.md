@@ -16,12 +16,13 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Schema | in-place change of cardinality/unique, tuple attrs added after open | todo |
 | Query | `:find` forms, aggregates, `:order-by`, `:limit`, `:offset`, `:keys`/`:strs`/`:syms`, pull in find | done |
 | Query | predicates `< <= > >= = != like not-like` | done |
-| Query | built-ins `get-else get-some missing? ground tuple untuple in not-in inc dec + - * / quot rem mod` | done |
+| Query | built-ins `get-else get-some get-some-else missing? ground tuple untuple in not-in inc dec + - * / quot rem mod` | done (nil is the keyword `:nil`) |
 | Query | `:in` scalar, collection, tuple, relation bindings (`QueryInput`, `q_str_inputs`, `execute_inputs`) | done |
 | Query | `or-join` / `not-join` join-variable scoping | done |
 | Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are naive fixpoint) |
 | Query | cost-based optimizer, `explain`, `analyze`, magic-set rules | todo |
-| Query | nested queries, UDFs, `get-some-else`, `like` escape option | todo |
+| Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
+| Query | nested queries, UDFs | todo |
 | Entity API | `rseek_datoms`, `search_datoms`, `fulltext_datoms`, `cardinality`, `max_eid` | done |
 | Entity API | lazy `entity` / `touch` (pull covers reads) | todo |
 | Listeners | `listen`/`unlisten` with a `TxReport` of added and retracted datoms, delivered after commit | done |
@@ -30,7 +31,9 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Bulk load | streaming / batched fill, `init-db` schema bootstrap | todo |
 | KV | get/put/delete/range/prefix/iter on LMDB, SQLite, redb, memory | done |
 | KV | list (dupsort) DBIs (`ListDb`), rank, by-rank, range count, first-n, clear | done |
-| KV | drop/copy/stat/list-dbis, sample, buffers; list ops not yet exposed via `Conn` | todo |
+| KV | list-dbis (all backends), drop-dbi, copy-to (LMDB and SQLite) | done |
+| KV | LMDB drop empties the DBI but cannot remove its name (pinned `heed`); copy on redb and memory unsupported | known limit |
+| KV | sample, buffers, stat beyond entry count, list ops exposed through `Conn` | todo |
 | Durability | Datalog write-ahead log (`Conn::open_wal`): framed and checksummed, replay of unapplied records, torn-tail recovery, `checkpoint`, strict and relaxed profiles | done |
 | Durability | KV-level WAL, segmented txlog, snapshots, GC, watermarks, env flags for no-sync writes, tx-group, async tx | todo |
 | Durability | a failed store commit after a log append is marked aborted, and replay skips it (replay path tested; the live failure path is not) | done |

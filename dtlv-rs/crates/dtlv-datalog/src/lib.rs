@@ -2062,12 +2062,14 @@ impl Conn {
                                     CmpOp::Lt => cmp_vals(a, b).is_some_and(|o| o == std::cmp::Ordering::Less),
                                     CmpOp::Ge => cmp_vals(a, b).is_some_and(|o| o != std::cmp::Ordering::Less),
                                     CmpOp::Gt => cmp_vals(a, b).is_some_and(|o| o == std::cmp::Ordering::Greater),
-                                    CmpOp::Like => match (a.as_str(), b.as_str()) {
-                                        (Some(text), Some(pat)) => like_match(text, pat),
-                                        _ => false,
-                                    },
-                                    CmpOp::NotLike => match (a.as_str(), b.as_str()) {
-                                        (Some(text), Some(pat)) => !like_match(text, pat),
+                                    CmpOp::Like(esc) | CmpOp::NotLike(esc) => match (a.as_str(), b.as_str()) {
+                                        (Some(text), Some(pat)) => {
+                                            let tokens = like_compile(pat, *esc).ok_or_else(|| {
+                                                DatalogError::Function(format!("invalid like pattern: {pat}"))
+                                            })?;
+                                            let hit = like_run(text, &tokens);
+                                            if matches!(op, CmpOp::NotLike(_)) { !hit } else { hit }
+                                        }
                                         _ => false,
                                     },
                                 };
@@ -2363,6 +2365,24 @@ impl Conn {
                 }
                 found
             }
+            // Total variant of get-some: `[nil else]` when no attribute is present. Datalevin's nil is
+            // represented by the keyword `:nil`, since a `Value` cannot be nil.
+            "get-some-else" => {
+                if args.len() < 3 {
+                    return Err(DatalogError::Function("get-some-else takes an entity, a default, and attributes".into()));
+                }
+                let mut found = None;
+                if let Some(e) = self.entity_arg(rtxn, &args[0])? {
+                    for a in &args[2..] {
+                        let attr = Self::attr_arg(a)?;
+                        if let Some(v) = self.get_attr(rtxn, e, attr)? {
+                            found = Some(Value::Tuple(vec![Value::Keyword(attr.to_owned()), v]));
+                            break;
+                        }
+                    }
+                }
+                Some(found.unwrap_or_else(|| Value::Tuple(vec![Value::Keyword(":nil".into()), args[1].clone()])))
+            }
             "missing?" => {
                 check_arity(name, args, 2)?;
                 let has = match self.entity_arg(rtxn, &args[0])? {
@@ -2427,30 +2447,63 @@ fn cmp_vals(va: &Value, vb: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// SQL-style `LIKE` wildcard matching (`%` = 0+ chars, `_` = 1 char), UTF-8 char-aware.
-pub fn like_match(text: &str, pattern: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LikeTok {
+    Lit(char),
+    AnyRun,
+    AnyOne,
+}
+
+/// Compiles a LIKE pattern: `%` any run, `_` one char, and an escape character that makes the next
+/// `%`, `_`, or escape literal. A trailing escape adds nothing. Other escapes are invalid (`None`).
+fn like_compile(pattern: &str, escape: char) -> Option<Vec<LikeTok>> {
+    let mut out = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        out.push(if c == escape {
+            match chars.next() {
+                None => continue,
+                Some(n) if n == '%' || n == '_' || n == escape => LikeTok::Lit(n),
+                Some(_) => return None,
+            }
+        } else {
+            match c {
+                '%' => LikeTok::AnyRun,
+                '_' => LikeTok::AnyOne,
+                other => LikeTok::Lit(other),
+            }
+        });
+    }
+    Some(out)
+}
+
+fn like_run(text: &str, p: &[LikeTok]) -> bool {
     let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
-    let (n, m) = (t.len(), p.len());
+    let m = p.len();
     let mut dp = vec![false; m + 1];
     dp[0] = true;
     for j in 1..=m {
-        if p[j - 1] == '%' {
+        if p[j - 1] == LikeTok::AnyRun {
             dp[j] = dp[j - 1];
         }
     }
-    for i in 1..=n {
+    for &ch in &t {
         let mut next = vec![false; m + 1];
         for j in 1..=m {
-            if p[j - 1] == '%' {
-                next[j] = next[j - 1] || dp[j];
-            } else if p[j - 1] == '_' || p[j - 1] == t[i - 1] {
-                next[j] = dp[j - 1];
-            }
+            next[j] = match p[j - 1] {
+                LikeTok::AnyRun => next[j - 1] || dp[j],
+                LikeTok::AnyOne => dp[j - 1],
+                LikeTok::Lit(c) => c == ch && dp[j - 1],
+            };
         }
         dp = next;
     }
     dp[m]
+}
+
+/// SQL-style `LIKE` with the default `!` escape (Datalevin's default).
+pub fn like_match(text: &str, pattern: &str) -> bool {
+    like_compile(pattern, parser::DEFAULT_ESCAPE).is_some_and(|t| like_run(text, &t))
 }
 
 pub struct PreparedPull<'conn> {
