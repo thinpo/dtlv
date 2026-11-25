@@ -103,9 +103,10 @@ pub enum DatalogError {
     SumOverflow,
 }
 
-/// Removes a SQLite database file and its WAL/SHM sidecars; missing files are fine.
-fn remove_sqlite_files(path: &Path) -> Result<(), DatalogError> {
-    for suffix in ["", "-wal", "-shm"] {
+/// Removes the given suffixed variants of a SQLite path (e.g. `""`, `"-wal"`, `"-shm"`);
+/// missing files are fine.
+fn remove_sqlite_files(path: &Path, suffixes: &[&str]) -> Result<(), DatalogError> {
+    for suffix in suffixes {
         let mut p = path.as_os_str().to_owned();
         p.push(suffix);
         match std::fs::remove_file(&p) {
@@ -328,8 +329,24 @@ impl Conn {
         // so a failed save never leaves a half-written or stale snapshot behind.
         let path = sqlite_path.as_ref();
         let tmp = sibling_tmp_path(path);
-        remove_sqlite_files(&tmp)?;
-        let dst = KvStore::open_sqlite(&tmp)?;
+        if let Err(e) = self.write_sqlite_snapshot(rtxn, &tmp) {
+            let _ = remove_sqlite_files(&tmp, &["", "-wal", "-shm"]);
+            return Err(e);
+        }
+        // Stale sidecars of the old destination would be replayed onto the new file, so
+        // drop them first. The old main file is left intact until rename replaces it
+        // atomically, so any failure before this point keeps the previous snapshot.
+        remove_sqlite_files(path, &["-wal", "-shm"])?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = remove_sqlite_files(&tmp, &["", "-wal", "-shm"]);
+            return Err(dtlv_kv::KvError::from(e).into());
+        }
+        Ok(())
+    }
+
+    fn write_sqlite_snapshot(&self, rtxn: &ReadTxn<'_>, tmp: &Path) -> Result<(), DatalogError> {
+        remove_sqlite_files(tmp, &["", "-wal", "-shm"])?;
+        let dst = KvStore::open_sqlite(tmp)?;
         let mut wtxn = dst.write_txn()?;
         for (dbi_name, s_db) in [
             ("meta", &self.meta),
@@ -354,9 +371,6 @@ impl Conn {
         wtxn.commit()?;
         dst.sync()?;
         drop(dst); // closing the last connection checkpoints and removes the tmp WAL
-        // Drop any stale sidecars that belonged to the old destination before replacing it.
-        remove_sqlite_files(path)?;
-        std::fs::rename(&tmp, path).map_err(dtlv_kv::KvError::from)?;
         Ok(())
     }
 
@@ -1312,33 +1326,37 @@ impl Conn {
             });
         }
 
-        // Dedup before offset/limit so distinct rows are not truncated prematurely.
+        // Set semantics on the projected key, applied after :order-by so the sort order of
+        // the first occurrence is kept. Offset and limit count distinct rows, and the scan
+        // stops once the page is full, so a limited query does not format every match.
         // Pull elements key on their entity var so each pulled entity stays distinct.
-        if parsed.order_by.is_empty() {
-            let mut seen = HashSet::new();
-            envs.retain(|env| {
-                let key: Vec<Option<&Value>> = parsed
-                    .find
-                    .iter()
-                    .map(|elem| match elem {
-                        FindElem::Var(v) | FindElem::Pull(v, _) => env.get(v),
-                        FindElem::Agg(_, _) => None,
-                    })
-                    .collect();
-                seen.insert(format!("{:?}", key))
-            });
-        }
-
         let start = parsed.offset.unwrap_or(0).max(0) as usize;
-        let envs_slice: Vec<HashMap<String, Value>> = if start >= envs.len() {
-            Vec::new()
-        } else {
-            let sliced = &envs[start..];
-            match parsed.limit {
-                Some(lim) if lim >= 0 => sliced.iter().take(lim as usize).cloned().collect(),
-                _ => sliced.to_vec(),
-            }
+        let limit = match parsed.limit {
+            Some(lim) if lim >= 0 => Some(lim as usize),
+            _ => None,
         };
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut envs_slice: Vec<HashMap<String, Value>> = Vec::new();
+        for env in envs {
+            let key: Vec<Option<&Value>> = parsed
+                .find
+                .iter()
+                .map(|elem| match elem {
+                    FindElem::Var(v) | FindElem::Pull(v, _) => env.get(v),
+                    FindElem::Agg(_, _) => None,
+                })
+                .collect();
+            if !seen.insert(format!("{:?}", key)) {
+                continue;
+            }
+            if seen.len() <= start {
+                continue;
+            }
+            if limit.is_some_and(|lim| envs_slice.len() >= lim) {
+                break;
+            }
+            envs_slice.push(env);
+        }
 
         // Handle (pull ?e [...]) inside :find [[(pull ?e [...]) ...]]
         if parsed.find.len() == 1 {
@@ -1365,7 +1383,6 @@ impl Conn {
             }
         }
 
-        // Rows are already deduplicated above when no :order-by is present.
         let mut rows = Vec::with_capacity(envs_slice.len());
         for env in &envs_slice {
             let mut row = Vec::with_capacity(parsed.find.len());

@@ -18,6 +18,8 @@ All notable changes to this repository are documented here.
 - Standardized canonical test command on `clojure -M:test ...` (see `SPEC.md`).
 - `cmp_vars` now matches `cmp_vals` ordering coverage (mixed I64/Instant, Keyword, Ref).
 - Benchmark timing sort is NaN-safe.
+- `TxItem::RetractEntity` now also removes incoming references (eav, ave and vae indexes) from other entities, which previously dangled. Callers that relied on those dangling refs must re-assert them after retracting the target.
+- Query deduplication streams over results and stops once `offset + limit` distinct rows are collected, so limited queries no longer format every match.
 - Entity terms in value position are treated as refs.
 - In-memory store: writers are serialized by a dedicated lock; readers no longer take the data lock for the duration of a write transaction.
 - Memory optimizations:
@@ -28,10 +30,10 @@ All notable changes to this repository are documented here.
 ### Fixed
 - Potential panic in benchmark sort when timing samples contain NaN.
 - Datalog query evaluation checks bound-variable consistency in scans, so a variable shared across pattern positions (e.g. `[?x :attr ?x]`) unifies instead of being overwritten.
-- Deduplication happens before offset/limit application, so `:limit`/`:offset` no longer return duplicate rows. Pull results are deduplicated per entity, so `(pull ?e ...)` without `:order-by` returns every match.
-- Entity retraction removes incoming references (eav, ave and vae indexes) from other entities, and propagates index errors instead of ignoring them.
+- Deduplication happens after `:order-by` and before offset/limit application, so `:limit`/`:offset` no longer return duplicate rows, including for ordered queries. Pull results are deduplicated per entity, so `(pull ?e ...)` without `:order-by` returns every match.
+- Entity retraction propagates index errors instead of ignoring them.
 - `Sum` aggregation preserves `i64` precision; overflow returns `DatalogError::SumOverflow` instead of wrapping.
-- `save_to_sqlite` writes to a temp file and atomically replaces the destination, removing stale `-wal`/`-shm` sidecars and never leaving a half-written snapshot.
+- `save_to_sqlite` writes to a temp file and atomically replaces the destination, removing stale `-wal`/`-shm` sidecars. A failed save keeps the previous snapshot intact and removes its temp files; the old main file is no longer deleted before the rename.
 
 ### Notes
 - Integration tests require host socket/LMDB permissions (XTDB v2 pgwire socket, Datalevin LMDB).
