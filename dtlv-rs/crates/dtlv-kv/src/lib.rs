@@ -9,6 +9,9 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
+pub mod list;
+pub use list::ListDb;
+
 #[derive(Debug, Error)]
 pub enum KvError {
     #[error("lmdb error: {0}")]
@@ -21,6 +24,10 @@ pub enum KvError {
     Io(#[from] std::io::Error),
     #[error("invalid table name: {0}")]
     InvalidTableName(String),
+    #[error("malformed list item key")]
+    InvalidListItem,
+    #[error("{0}")]
+    Config(String),
 }
 
 impl From<redb::Error> for KvError {
@@ -425,6 +432,27 @@ impl RawDb {
             }
             _ => unreachable!("mismatched RawDb and WriteTxn backend"),
         }
+    }
+
+    /// Every entry inside a write transaction, in key order. LMDB rejects an empty prefix scan, so the
+    /// whole-DBI read goes through the native iterator there.
+    pub fn iter_rw(&self, txn: &WriteTxn<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        let mut out = Vec::new();
+        match (self, txn) {
+            (RawDb::Lmdb(db), WriteTxn::Lmdb(w)) => {
+                for item in db.iter(w)? {
+                    let (k, v) = item?;
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+            _ => {
+                for item in self.prefix_iter_rw(txn, &[])? {
+                    let (k, v) = item?;
+                    out.push((k.into_owned(), v.into_owned()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn range<'txn>(

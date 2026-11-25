@@ -7,10 +7,12 @@ use dtlv_codec::{
     encode_eav_key, encode_vae_key, AttrId, CodecError, EntityId, Value,
 };
 use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
-use dtlv_search::{FullTextIndex, Metric, VectorIndex};
+use dtlv_search::{FullTextIndex, FtsConfig, Metric, VectorIndex};
+pub use dtlv_search::{FtsConfig as FulltextConfig, Query as FtsQuery};
+pub use parser::QueryInput;
 use parser::{
-    parse_query, parse_query_template, parse_rules, AggOp, Clause, CmpOp, ExprTerm, FindElem,
-    FindSpec, OrderKey, ParseError, ParsedQuery, RuleDef,
+    parse_query_inputs, parse_query_template, parse_rules, AggOp, Clause, CmpOp, ExprTerm,
+    FindElem, FindSpec, FnOut, InBinding, OrderKey, ParseError, ParsedQuery, RuleDef,
 };
 use thiserror::Error;
 
@@ -34,6 +36,8 @@ pub struct AttrSpec {
     pub index: bool,
     pub fulltext: bool,
     pub is_component: bool,
+    /// Source attribute names when this is a composite tuple (`:db/tupleAttrs`).
+    pub tuple_sources: Option<Vec<String>>,
 }
 
 impl AttrSpec {
@@ -45,7 +49,14 @@ impl AttrSpec {
             index: false,
             fulltext: false,
             is_component: false,
+            tuple_sources: None,
         }
+    }
+
+    /// Declares a composite tuple attribute over cardinality-one source attributes.
+    pub fn tuple_of(mut self, sources: &[&str]) -> Self {
+        self.tuple_sources = Some(sources.iter().map(|s| (*s).to_owned()).collect());
+        self
     }
 
     pub fn unique_identity(mut self) -> Self {
@@ -101,6 +112,14 @@ pub enum DatalogError {
     CasFailed { eid: EntityId, attr: String },
     #[error("integer overflow in sum aggregate")]
     SumOverflow,
+    #[error("query function error: {0}")]
+    Function(String),
+    #[error("invalid schema: {0}")]
+    Schema(String),
+    #[error("tuple attribute {0} is derived from its sources and cannot be written directly")]
+    TupleWrite(String),
+    #[error("unknown transaction function: {0}")]
+    UnknownTxFn(String),
 }
 
 /// Removes the given suffixed variants of a SQLite path (e.g. `""`, `"-wal"`, `"-shm"`);
@@ -158,6 +177,55 @@ pub enum TxItem {
     RetractEntity(EntityId),
     /// Atomic compare-and-swap: replace `expected` with `new_val` on `(eid, attr)`.
     Cas(EntityId, String, Value, Value),
+    /// Removes every value of `(eid, attr)` (`:db.fn/retractAttribute`).
+    RetractAttribute(EntityId, String),
+    /// Runs a registered transaction function; its returned items are applied in the same transaction.
+    Call(String, Vec<Value>),
+}
+
+/// Read view handed to a transaction function. Sees the in-progress transaction.
+pub struct TxView<'a, 'w> {
+    conn: &'a Conn,
+    wtxn: &'a WriteTxn<'w>,
+}
+
+impl TxView<'_, '_> {
+    pub fn get_attr(&self, eid: EntityId, attr: &str) -> Result<Option<Value>, DatalogError> {
+        let aid = self.conn.attr_id(attr)?;
+        self.conn.get_attr_rw(self.wtxn, eid, aid)
+    }
+
+    pub fn lookup(&self, attr: &str, val: &Value) -> Result<Option<EntityId>, DatalogError> {
+        let aid = self.conn.attr_id(attr)?;
+        let mut buf = Vec::new();
+        self.conn.lookup_ave_rw(self.wtxn, aid, val, &mut buf)
+    }
+}
+
+pub type TxFn = Box<dyn Fn(&TxView<'_, '_>, &[Value]) -> Result<Vec<TxItem>, DatalogError>>;
+
+/// One datom added (`added: true`) or retracted by a committed transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxDatum {
+    pub eid: EntityId,
+    pub attr: String,
+    pub value: Value,
+    pub added: bool,
+}
+
+/// What a committed transaction changed, delivered to listeners.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxReport {
+    pub tx_data: Vec<TxDatum>,
+}
+
+#[derive(Default)]
+struct TxState {
+    changes: Vec<TxDatum>,
+    touched: Vec<EntityId>,
+    tempids: HashMap<String, EntityId>,
+    eav_buf: Vec<u8>,
+    ave_buf: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +293,11 @@ pub struct Conn {
     attr_ids: HashMap<String, AttrId>,
     aid_names: HashMap<AttrId, String>,
     attrs: HashMap<AttrId, AttrSpec>,
+    /// `(target name, target attr, source attrs)` for each composite tuple attribute.
+    tuple_specs: Vec<(String, AttrId, Vec<AttrId>)>,
+    tuple_targets: HashSet<AttrId>,
+    tx_fns: HashMap<String, TxFn>,
+    listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
 }
 
 impl Conn {
@@ -304,6 +377,33 @@ impl Conn {
         meta.put(&mut wtxn, NEXT_AID_KEY, &next_aid.to_be_bytes())?;
         wtxn.commit()?;
 
+        for (name, &aid) in &attr_ids {
+            attrs.entry(aid).or_insert_with(|| AttrSpec::new(name.clone()));
+        }
+        let mut tuple_specs = Vec::new();
+        let mut tuple_targets = HashSet::new();
+        for (&aid, spec) in &attrs {
+            let Some(sources) = &spec.tuple_sources else { continue };
+            let mut src_ids = Vec::with_capacity(sources.len());
+            for name in sources {
+                let sid = *attr_ids.get(name).ok_or_else(|| {
+                    DatalogError::Schema(format!("tuple source {name} of {} is not in the schema", spec.name))
+                })?;
+                let src = attrs.get(&sid).ok_or_else(|| {
+                    DatalogError::Schema(format!("tuple source {name} of {} is not in the schema", spec.name))
+                })?;
+                if src.cardinality == Cardinality::Many || src.tuple_sources.is_some() {
+                    return Err(DatalogError::Schema(format!(
+                        "tuple source {name} of {} must be a cardinality-one, non-tuple attribute",
+                        spec.name
+                    )));
+                }
+                src_ids.push(sid);
+            }
+            tuple_targets.insert(aid);
+            tuple_specs.push((spec.name.clone(), aid, src_ids));
+        }
+
         Ok(Self {
             store,
             eav,
@@ -315,6 +415,10 @@ impl Conn {
             attr_ids,
             aid_names,
             attrs,
+            tuple_specs,
+            tuple_targets,
+            tx_fns: HashMap::new(),
+            listeners: Vec::new(),
         })
     }
 
@@ -760,6 +864,30 @@ impl Conn {
         Ok(out)
     }
 
+    /// Bulk-loads trusted `(entity, attribute, value)` datoms in one transaction; all of them apply or none do.
+    /// Datoms are grouped by entity, and the usual schema checks still run.
+    pub fn load_datoms(&self, datoms: &[(EntityId, String, Value)]) -> Result<(), DatalogError> {
+        let mut by_eid: std::collections::BTreeMap<EntityId, Vec<(String, Value)>> = std::collections::BTreeMap::new();
+        for (eid, attr, val) in datoms {
+            by_eid.entry(*eid).or_default().push((attr.clone(), val.clone()));
+        }
+        let items: Vec<TxItem> = by_eid.into_iter().map(|(eid, pairs)| TxItem::Assert(Some(eid), pairs)).collect();
+        self.transact(&items)?;
+        Ok(())
+    }
+
+    /// Keeps the fresh-id counter above every explicitly supplied entity id, so later allocations never collide.
+    fn bump_next_eid(&self, wtxn: &mut WriteTxn<'_>, eid: EntityId) -> Result<(), DatalogError> {
+        let next = match self.meta.get_rw(wtxn, NEXT_EID_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 1,
+        };
+        if eid >= next {
+            self.meta.put(wtxn, NEXT_EID_KEY, &(eid + 1).to_be_bytes())?;
+        }
+        Ok(())
+    }
+
     fn alloc_eid(&self, wtxn: &mut WriteTxn<'_>) -> Result<EntityId, DatalogError> {
         let next = match self.meta.get_rw(wtxn, NEXT_EID_KEY)? {
             Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
@@ -785,7 +913,7 @@ impl Conn {
         Ok(None)
     }
 
-    fn remove_ea_cardinality_one(
+    fn remove_ea_values(
         &self,
         wtxn: &mut WriteTxn<'_>,
         eid: EntityId,
@@ -793,6 +921,7 @@ impl Conn {
         spec: &AttrSpec,
         kbuf: &mut Vec<u8>,
         ave_buf: &mut Vec<u8>,
+        changes: &mut Vec<TxDatum>,
     ) -> Result<(), DatalogError> {
         encode_ea_prefix(eid, aid, kbuf);
         let existing: Vec<Vec<u8>> = self
@@ -803,6 +932,7 @@ impl Conn {
         for old_eav in existing {
             let old_val = decode_value(&old_eav[12..])?;
             self.eav.delete(wtxn, &old_eav)?;
+            changes.push(TxDatum { eid, attr: spec.name.clone(), value: old_val.clone(), added: false });
             if spec.index {
                 encode_ave_key(aid, &old_val, eid, ave_buf);
                 self.ave.delete(wtxn, ave_buf)?;
@@ -820,6 +950,7 @@ impl Conn {
         wtxn: &mut WriteTxn<'_>,
         eid: EntityId,
         ave_buf: &mut Vec<u8>,
+        changes: &mut Vec<TxDatum>,
     ) -> Result<(), DatalogError> {
         // Remove incoming references to this entity from other entities.
         // vae keys are target(8) | aid(4) | src(8); collect before deleting.
@@ -838,6 +969,7 @@ impl Conn {
             let val = Value::Ref(eid);
             encode_eav_key(src, aid, &val, ave_buf);
             self.eav.delete(wtxn, ave_buf)?;
+            changes.push(TxDatum { eid: src, attr: self.aid_names[&aid].clone(), value: val.clone(), added: false });
             if let Some(spec) = self.attrs.get(&aid) {
                 if spec.index {
                     encode_ave_key(aid, &val, src, ave_buf);
@@ -860,6 +992,7 @@ impl Conn {
             let aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
             let val = decode_value(&k[12..])?;
             self.eav.delete(wtxn, &k)?;
+            changes.push(TxDatum { eid, attr: self.aid_names[&aid].clone(), value: val.clone(), added: false });
             if let Some(spec) = self.attrs.get(&aid) {
                 if spec.index {
                     encode_ave_key(aid, &val, eid, ave_buf);
@@ -883,157 +1016,278 @@ impl Conn {
             self.fts.remove_doc(wtxn, eid)?;
         }
         for child in component_children {
-            self.retract_entity_recursive(wtxn, child, ave_buf)?;
+            self.retract_entity_recursive(wtxn, child, ave_buf, changes)?;
         }
         Ok(())
     }
 
     pub fn transact(&self, items: &[TxItem]) -> Result<Vec<EntityId>, DatalogError> {
         let mut wtxn = self.store.write_txn()?;
-        let mut eav_buf = Vec::with_capacity(64);
-        let mut ave_buf = Vec::with_capacity(64);
-        let mut touched = Vec::with_capacity(items.len());
-        let mut tempids: HashMap<String, EntityId> = HashMap::new();
-
+        let mut st = TxState::default();
         for item in items {
-            match item {
-                TxItem::Assert(explicit_eid, pairs) => {
-                    let mut resolved_eid = *explicit_eid;
-                    if resolved_eid.is_none() {
-                        for (attr_name, val) in pairs {
-                            let aid = self.attr_id(attr_name)?;
-                            let spec = &self.attrs[&aid];
-                            if spec.unique == Some(Unique::Identity) {
-                                if let Some(found) =
-                                    self.lookup_ave_rw(&wtxn, aid, val, &mut ave_buf)?
-                                {
-                                    resolved_eid = Some(found);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let eid = match resolved_eid {
-                        Some(id) => id,
-                        None => self.alloc_eid(&mut wtxn)?,
-                    };
-                    touched.push(eid);
+            self.apply_item(&mut wtxn, item, &mut st)?;
+        }
+        self.recompute_tuples(&mut wtxn, &st.touched, &mut st.changes)?;
+        wtxn.commit()?;
+        if !st.changes.is_empty() && !self.listeners.is_empty() {
+            let report = TxReport { tx_data: std::mem::take(&mut st.changes) };
+            for (_, f) in &self.listeners {
+                f(&report);
+            }
+        }
+        Ok(st.touched)
+    }
 
-                    for (attr_name, val) in pairs {
-                        self.assert_datom(&mut wtxn, eid, attr_name, val, &mut eav_buf, &mut ave_buf)?;
-                    }
-                }
-                TxItem::AssertRef(eref, pairs) => {
-                    let eid = match eref {
-                        EntityRef::Id(id) => *id,
-                        EntityRef::TempId(tid) => {
-                            if let Some(&id) = tempids.get(tid) {
-                                id
-                            } else {
-                                let id = self.alloc_eid(&mut wtxn)?;
-                                tempids.insert(tid.clone(), id);
-                                id
-                            }
-                        }
-                        EntityRef::LookupRef(attr_name, val) => {
-                            let aid = self.attr_id(attr_name)?;
-                            if let Some(found) = self.lookup_ave_rw(&wtxn, aid, val, &mut ave_buf)? {
-                                found
-                            } else {
-                                self.alloc_eid(&mut wtxn)?
-                            }
-                        }
-                        EntityRef::New => {
-                            let mut found_id = None;
-                            for (attr_name, txv) in pairs {
-                                if let TxVal::Val(val) = txv {
-                                    let aid = self.attr_id(attr_name)?;
-                                    if self.attrs[&aid].unique == Some(Unique::Identity) {
-                                        if let Some(f) = self.lookup_ave_rw(&wtxn, aid, val, &mut ave_buf)? {
-                                            found_id = Some(f);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            match found_id {
-                                Some(id) => id,
-                                None => self.alloc_eid(&mut wtxn)?,
-                            }
-                        }
-                    };
-                    touched.push(eid);
-
-                    for (attr_name, txv) in pairs {
-                        let resolved_val = match txv {
-                            TxVal::Val(v) => v.clone(),
-                            TxVal::TempRef(tid) => {
-                                let target = if let Some(&id) = tempids.get(tid) {
-                                    id
-                                } else {
-                                    let id = self.alloc_eid(&mut wtxn)?;
-                                    tempids.insert(tid.clone(), id);
-                                    id
-                                };
-                                Value::Ref(target)
-                            }
-                            TxVal::LookupRef(lattr, lval) => {
-                                let laid = self.attr_id(lattr)?;
-                                let target = match self.lookup_ave_rw(&wtxn, laid, lval, &mut ave_buf)? {
-                                    Some(id) => id,
-                                    None => self.alloc_eid(&mut wtxn)?,
-                                };
-                                Value::Ref(target)
-                            }
-                        };
-                        self.assert_datom(&mut wtxn, eid, attr_name, &resolved_val, &mut eav_buf, &mut ave_buf)?;
-                    }
-                }
-                TxItem::Retract(eid, attr_name, val) => {
-                    let aid = self.attr_id(attr_name)?;
-                    let spec = &self.attrs[&aid];
-                    encode_eav_key(*eid, aid, val, &mut eav_buf);
-                    self.eav.delete(&mut wtxn, &eav_buf)?;
-                    if spec.index {
-                        encode_ave_key(aid, val, *eid, &mut ave_buf);
-                        self.ave.delete(&mut wtxn, &ave_buf)?;
-                    }
-                    if let Value::Ref(target) = val {
-                        encode_vae_key(*target, aid, *eid, &mut ave_buf);
-                        self.vae.delete(&mut wtxn, &ave_buf)?;
-                    }
-                    if spec.fulltext {
-                        self.fts.remove_doc(&mut wtxn, *eid)?;
-                    }
-                }
-                TxItem::RetractEntity(eid) => {
-                    self.retract_entity_recursive(&mut wtxn, *eid, &mut ave_buf)?;
-                }
-                TxItem::Cas(eid, attr_name, expected, new_val) => {
-                    let aid = self.attr_id(attr_name)?;
-                    let mut pref = [0u8; 12];
-                    pref[..8].copy_from_slice(&eid.to_be_bytes());
-                    pref[8..12].copy_from_slice(&aid.to_be_bytes());
-                    let cur = if let Some(res) = self.eav.prefix_iter_rw(&wtxn, &pref)?.next() {
-                        let (k, _) = res?;
-                        Some(decode_value(&k[12..])?)
-                    } else {
-                        None
-                    };
-                    if cur.as_ref() != Some(expected) {
-                        return Err(DatalogError::CasFailed {
-                            eid: *eid,
-                            attr: attr_name.clone(),
-                        });
-                    }
-                    self.assert_datom(&mut wtxn, *eid, attr_name, new_val, &mut eav_buf, &mut ave_buf)?;
-                    touched.push(*eid);
+    fn reject_tuple_writes<'n>(&self, names: impl IntoIterator<Item = &'n str>) -> Result<(), DatalogError> {
+        for name in names {
+            if let Some(aid) = self.attr_ids.get(name) {
+                if self.tuple_targets.contains(aid) {
+                    return Err(DatalogError::TupleWrite(name.to_owned()));
                 }
             }
         }
+        Ok(())
+    }
 
-        wtxn.commit()?;
-        Ok(touched)
+    fn apply_item(&self, wtxn: &mut WriteTxn<'_>, item: &TxItem, st: &mut TxState) -> Result<(), DatalogError> {
+        match item {
+            TxItem::Assert(explicit_eid, pairs) => {
+                self.reject_tuple_writes(pairs.iter().map(|(a, _)| a.as_str()))?;
+                let mut resolved_eid = *explicit_eid;
+                if resolved_eid.is_none() {
+                    for (attr_name, val) in pairs {
+                        let aid = self.attr_id(attr_name)?;
+                        let spec = &self.attrs[&aid];
+                        if spec.unique == Some(Unique::Identity) {
+                            if let Some(found) = self.lookup_ave_rw(&*wtxn, aid, val, &mut st.ave_buf)? {
+                                resolved_eid = Some(found);
+                                break;
+                            }
+                        }
+                    }
+                }
+                let eid = match resolved_eid {
+                    Some(id) => id,
+                    None => self.alloc_eid(wtxn)?,
+                };
+                self.bump_next_eid(wtxn, eid)?;
+                st.touched.push(eid);
+
+                for (attr_name, val) in pairs {
+                    self.assert_datom(wtxn, eid, attr_name, val, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                }
+            }
+            TxItem::AssertRef(eref, pairs) => {
+                self.reject_tuple_writes(pairs.iter().map(|(a, _)| a.as_str()))?;
+                let eid = match eref {
+                    EntityRef::Id(id) => {
+                        self.bump_next_eid(wtxn, *id)?;
+                        *id
+                    }
+                    EntityRef::TempId(tid) => match st.tempids.get(tid) {
+                        Some(&id) => id,
+                        None => {
+                            let id = self.alloc_eid(wtxn)?;
+                            st.tempids.insert(tid.clone(), id);
+                            id
+                        }
+                    },
+                    EntityRef::LookupRef(attr_name, val) => {
+                        let aid = self.attr_id(attr_name)?;
+                        match self.lookup_ave_rw(&*wtxn, aid, val, &mut st.ave_buf)? {
+                            Some(found) => found,
+                            None => self.alloc_eid(wtxn)?,
+                        }
+                    }
+                    EntityRef::New => {
+                        let mut found_id = None;
+                        for (attr_name, txv) in pairs {
+                            if let TxVal::Val(val) = txv {
+                                let aid = self.attr_id(attr_name)?;
+                                if self.attrs[&aid].unique == Some(Unique::Identity) {
+                                    if let Some(f) = self.lookup_ave_rw(&*wtxn, aid, val, &mut st.ave_buf)? {
+                                        found_id = Some(f);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        match found_id {
+                            Some(id) => id,
+                            None => self.alloc_eid(wtxn)?,
+                        }
+                    }
+                };
+                st.touched.push(eid);
+
+                for (attr_name, txv) in pairs {
+                    let resolved_val = match txv {
+                        TxVal::Val(v) => v.clone(),
+                        TxVal::TempRef(tid) => {
+                            let target = match st.tempids.get(tid) {
+                                Some(&id) => id,
+                                None => {
+                                    let id = self.alloc_eid(wtxn)?;
+                                    st.tempids.insert(tid.clone(), id);
+                                    id
+                                }
+                            };
+                            Value::Ref(target)
+                        }
+                        TxVal::LookupRef(lattr, lval) => {
+                            let laid = self.attr_id(lattr)?;
+                            let target = match self.lookup_ave_rw(&*wtxn, laid, lval, &mut st.ave_buf)? {
+                                Some(id) => id,
+                                None => self.alloc_eid(wtxn)?,
+                            };
+                            Value::Ref(target)
+                        }
+                    };
+                    self.assert_datom(wtxn, eid, attr_name, &resolved_val, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                }
+            }
+            TxItem::Retract(eid, attr_name, val) => {
+                self.reject_tuple_writes([attr_name.as_str()])?;
+                let aid = self.attr_id(attr_name)?;
+                let spec = &self.attrs[&aid];
+                encode_eav_key(*eid, aid, val, &mut st.eav_buf);
+                if self.eav.delete(wtxn, &st.eav_buf)? {
+                    st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: val.clone(), added: false });
+                }
+                if spec.index {
+                    encode_ave_key(aid, val, *eid, &mut st.ave_buf);
+                    self.ave.delete(wtxn, &st.ave_buf)?;
+                }
+                if let Value::Ref(target) = val {
+                    encode_vae_key(*target, aid, *eid, &mut st.ave_buf);
+                    self.vae.delete(wtxn, &st.ave_buf)?;
+                }
+                if spec.fulltext {
+                    self.fts.remove_doc(wtxn, *eid)?;
+                }
+                st.touched.push(*eid);
+            }
+            TxItem::RetractAttribute(eid, attr_name) => {
+                self.reject_tuple_writes([attr_name.as_str()])?;
+                let aid = self.attr_id(attr_name)?;
+                let spec = &self.attrs[&aid];
+                self.remove_ea_values(wtxn, *eid, aid, spec, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                if spec.fulltext {
+                    self.fts.remove_doc(wtxn, *eid)?;
+                }
+                st.touched.push(*eid);
+            }
+            TxItem::RetractEntity(eid) => {
+                self.retract_entity_recursive(wtxn, *eid, &mut st.ave_buf, &mut st.changes)?;
+            }
+            TxItem::Cas(eid, attr_name, expected, new_val) => {
+                self.reject_tuple_writes([attr_name.as_str()])?;
+                let aid = self.attr_id(attr_name)?;
+                let cur = self.get_attr_rw(&*wtxn, *eid, aid)?;
+                if cur.as_ref() != Some(expected) {
+                    return Err(DatalogError::CasFailed {
+                        eid: *eid,
+                        attr: attr_name.clone(),
+                    });
+                }
+                self.assert_datom(wtxn, *eid, attr_name, new_val, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                st.touched.push(*eid);
+            }
+            TxItem::Call(name, args) => {
+                let f = self
+                    .tx_fns
+                    .get(name)
+                    .ok_or_else(|| DatalogError::UnknownTxFn(name.clone()))?;
+                let produced = f(&TxView { conn: self, wtxn: &*wtxn }, args)?;
+                for it in &produced {
+                    if matches!(it, TxItem::Call(..)) {
+                        return Err(DatalogError::Function(format!("transaction function {name} returned a call")));
+                    }
+                    self.apply_item(wtxn, it, st)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-derives every composite tuple attribute of the touched entities from its source attributes.
+    fn recompute_tuples(
+        &self,
+        wtxn: &mut WriteTxn<'_>,
+        touched: &[EntityId],
+        changes: &mut Vec<TxDatum>,
+    ) -> Result<(), DatalogError> {
+        if self.tuple_specs.is_empty() {
+            return Ok(());
+        }
+        let mut eids = touched.to_vec();
+        eids.sort_unstable();
+        eids.dedup();
+        let (mut eav_buf, mut ave_buf) = (Vec::new(), Vec::new());
+        for eid in eids {
+            for (name, target, sources) in &self.tuple_specs {
+                let mut parts = Vec::with_capacity(sources.len());
+                let mut complete = true;
+                for &s in sources {
+                    match self.get_attr_rw(&*wtxn, eid, s)? {
+                        Some(v) => parts.push(v),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                let old = self.get_attr_rw(&*wtxn, eid, *target)?;
+                let new = complete.then(|| Value::Tuple(parts));
+                if old != new {
+                    if old.is_some() {
+                        let spec = &self.attrs[target];
+                        self.remove_ea_values(wtxn, eid, *target, spec, &mut eav_buf, &mut ave_buf, changes)?;
+                    }
+                    if let Some(v) = new {
+                        self.assert_datom(wtxn, eid, name, &v, &mut eav_buf, &mut ave_buf, changes)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the single current value of `(eid, aid)` inside a write transaction.
+    fn get_attr_rw(&self, wtxn: &WriteTxn<'_>, eid: EntityId, aid: AttrId) -> Result<Option<Value>, DatalogError> {
+        let mut pref = [0u8; 12];
+        pref[..8].copy_from_slice(&eid.to_be_bytes());
+        pref[8..12].copy_from_slice(&aid.to_be_bytes());
+        if let Some(res) = self.eav.prefix_iter_rw(wtxn, &pref)?.next() {
+            let (k, _) = res?;
+            return Ok(Some(decode_value(&k[12..])?));
+        }
+        Ok(None)
+    }
+
+    /// Registers a listener that receives a `TxReport` after every committed transaction that changes data.
+    /// Re-registering a key replaces the earlier listener.
+    pub fn listen<F>(&mut self, key: &str, f: F)
+    where
+        F: Fn(&TxReport) + 'static,
+    {
+        self.listeners.retain(|(k, _)| k != key);
+        self.listeners.push((key.to_owned(), Box::new(f)));
+    }
+
+    /// Removes a listener by key, returning whether one was registered.
+    pub fn unlisten(&mut self, key: &str) -> bool {
+        let before = self.listeners.len();
+        self.listeners.retain(|(k, _)| k != key);
+        self.listeners.len() != before
+    }
+
+    /// Registers a named transaction function, invoked with `TxItem::Call`.
+    pub fn register_tx_fn<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&TxView<'_, '_>, &[Value]) -> Result<Vec<TxItem>, DatalogError> + 'static,
+    {
+        self.tx_fns.insert(name.to_owned(), Box::new(f));
     }
 
     fn assert_datom(
@@ -1044,6 +1298,7 @@ impl Conn {
         val: &Value,
         eav_buf: &mut Vec<u8>,
         ave_buf: &mut Vec<u8>,
+        changes: &mut Vec<TxDatum>,
     ) -> Result<(), DatalogError> {
         let aid = self.attr_id(attr_name)?;
         let spec = &self.attrs[&aid];
@@ -1060,11 +1315,12 @@ impl Conn {
         }
 
         if spec.cardinality == Cardinality::One {
-            self.remove_ea_cardinality_one(wtxn, eid, aid, spec, eav_buf, ave_buf)?;
+            self.remove_ea_values(wtxn, eid, aid, spec, eav_buf, ave_buf, changes)?;
         }
 
         encode_eav_key(eid, aid, val, eav_buf);
         self.eav.put(wtxn, eav_buf, &[])?;
+        changes.push(TxDatum { eid, attr: attr_name.to_owned(), value: val.clone(), added: true });
 
         if spec.index {
             encode_ave_key(aid, val, eid, ave_buf);
@@ -1080,6 +1336,29 @@ impl Conn {
             }
         }
         Ok(())
+    }
+
+    /// Analysis settings of the connection's full-text index.
+    pub fn fulltext_config(&self) -> FtsConfig {
+        self.fts.config()
+    }
+
+    /// Changes the full-text analysis settings. Only allowed before any document is indexed.
+    pub fn set_fulltext_config(&mut self, cfg: FtsConfig) -> Result<(), DatalogError> {
+        let mut wtxn = self.store.write_txn()?;
+        self.fts.set_config(&mut wtxn, cfg)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Evaluates a boolean/phrase full-text query tree, returning `(entity, score)` pairs.
+    pub fn fulltext_query(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query: &FtsQuery,
+        limit: usize,
+    ) -> Result<Vec<(EntityId, f64)>, DatalogError> {
+        Ok(self.fts.search_query(rtxn, query, limit)?)
     }
 
     pub fn fulltext_search(
@@ -1263,7 +1542,20 @@ impl Conn {
         inputs: &[Value],
         rules_str: &str,
     ) -> Result<QueryResult, DatalogError> {
-        let parsed = parse_query(query_str, inputs)?;
+        let typed: Vec<QueryInput> = inputs.iter().cloned().map(QueryInput::Scalar).collect();
+        self.q_str_inputs(rtxn, query_str, &typed, rules_str)
+    }
+
+    /// Like `q_str_with_rules`, but each `:in` input may be a scalar, collection, tuple, or relation.
+    pub fn q_str_inputs(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query_str: &str,
+        inputs: &[QueryInput],
+        rules_str: &str,
+    ) -> Result<QueryResult, DatalogError> {
+        let parsed = parse_query_inputs(query_str, inputs)?;
+        let seed = seed_envs(&parsed.in_bindings, inputs)?;
         let rules = parse_rules(rules_str)?;
         let mut rule_map: HashMap<String, Vec<RuleDef>> = HashMap::new();
         for r in rules {
@@ -1275,7 +1567,7 @@ impl Conn {
             self.eval_all_rules(rtxn, &rule_map)?
         };
 
-        let envs = self.eval_clauses(rtxn, &parsed.clauses, vec![HashMap::new()], &rule_tables)?;
+        let envs = self.eval_clauses(rtxn, &parsed.clauses, seed, &rule_tables)?;
         self.finalize_query_result(rtxn, &parsed, envs)
     }
 
@@ -1622,6 +1914,10 @@ impl Conn {
                                         (Some(text), Some(pat)) => like_match(text, pat),
                                         _ => false,
                                     },
+                                    CmpOp::NotLike => match (a.as_str(), b.as_str()) {
+                                        (Some(text), Some(pat)) => !like_match(text, pat),
+                                        _ => false,
+                                    },
                                 };
                                 if pass {
                                     next_envs.push(env);
@@ -1631,10 +1927,71 @@ impl Conn {
                         }
                     }
                 }
+                Clause::Fn(name, args, out) => {
+                    for mut env in envs {
+                        let mut vals = Vec::with_capacity(args.len());
+                        for a in args {
+                            match resolve_term(&env, a) {
+                                Some(v) => vals.push(v.clone()),
+                                None => return Err(DatalogError::UnboundVar(format!("{a:?}"))),
+                            }
+                        }
+                        let result = self.call_fn(rtxn, name, &vals)?;
+                        match (out, result) {
+                            (FnOut::None, Some(v)) => {
+                                if v != Value::Bool(false) {
+                                    next_envs.push(env);
+                                }
+                            }
+                            (FnOut::None, None) => {}
+                            (FnOut::Var(x), Some(v)) => {
+                                if bind_var(&mut env, x, v) {
+                                    next_envs.push(env);
+                                }
+                            }
+                            (FnOut::Var(_), None) => {}
+                            (FnOut::Tuple(xs), Some(Value::Tuple(vs))) => {
+                                if vs.len() != xs.len() {
+                                    return Err(DatalogError::Function(format!(
+                                        "{name} returned {} values for {} bindings",
+                                        vs.len(),
+                                        xs.len()
+                                    )));
+                                }
+                                if xs.iter().zip(vs).all(|(x, v)| bind_var(&mut env, x, v)) {
+                                    next_envs.push(env);
+                                }
+                            }
+                            (FnOut::Tuple(_), None) => {}
+                            (FnOut::Tuple(_), Some(_)) => {
+                                return Err(DatalogError::Function(format!("{name} must return a tuple")));
+                            }
+                        }
+                    }
+                }
                 Clause::Or(branches) => {
                     for branch in branches {
                         let branch_envs = self.eval_clauses(rtxn, branch, envs.clone(), rule_tables)?;
                         next_envs.extend(branch_envs);
+                    }
+                }
+                Clause::OrJoin(join, branches) => {
+                    // Only the outer variables and the join variables survive a branch; the rest are branch-local.
+                    let outer: HashSet<String> = envs.iter().flat_map(|e| e.keys().cloned()).collect();
+                    for branch in branches {
+                        for mut be in self.eval_clauses(rtxn, branch, envs.clone(), rule_tables)? {
+                            be.retain(|k, _| outer.contains(k) || join.contains(k));
+                            next_envs.push(be);
+                        }
+                    }
+                }
+                Clause::NotJoin(join, inner) => {
+                    for env in envs {
+                        let scoped: HashMap<String, Value> =
+                            env.iter().filter(|(k, _)| join.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                        if self.eval_clauses(rtxn, inner, vec![scoped], rule_tables)?.is_empty() {
+                            next_envs.push(env);
+                        }
                     }
                 }
                 Clause::Not(inner) => {
@@ -1687,6 +2044,213 @@ impl Conn {
             envs = next_envs;
         }
         Ok(envs)
+    }
+}
+
+/// Binds `var` to `val`, or checks equality if it is already bound. Returns false on conflict.
+fn bind_var(env: &mut HashMap<String, Value>, var: &str, val: Value) -> bool {
+    match env.get(var) {
+        Some(existing) => *existing == val,
+        None => {
+            env.insert(var.to_owned(), val);
+            true
+        }
+    }
+}
+
+/// Expands `:in` inputs into starting environments. Collections and relations multiply out,
+/// and a variable repeated across bindings must agree.
+fn seed_envs(
+    bindings: &[InBinding],
+    inputs: &[QueryInput],
+) -> Result<Vec<HashMap<String, Value>>, DatalogError> {
+    let mismatch = || DatalogError::Parse(ParseError::InvalidQuery(":in input does not match its binding shape".into()));
+    if bindings.len() != inputs.len() {
+        return Err(DatalogError::Parse(ParseError::InvalidQuery(format!(
+            "expected {} :in arguments, got {}",
+            bindings.len(),
+            inputs.len()
+        ))));
+    }
+    let mut envs = vec![HashMap::new()];
+    for (b, inp) in bindings.iter().zip(inputs) {
+        let parts: Vec<Vec<(String, Value)>> = match (b, inp) {
+            (InBinding::Scalar(v), QueryInput::Scalar(x)) => vec![vec![(v.clone(), x.clone())]],
+            (InBinding::Coll(v), QueryInput::Coll(xs)) => {
+                xs.iter().map(|x| vec![(v.clone(), x.clone())]).collect()
+            }
+            (InBinding::Tuple(vs), QueryInput::Tuple(xs)) if vs.len() == xs.len() => {
+                vec![vs.iter().cloned().zip(xs.iter().cloned()).collect()]
+            }
+            (InBinding::Rel(vs), QueryInput::Rel(rows)) => {
+                let mut parts = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if r.len() != vs.len() {
+                        return Err(mismatch());
+                    }
+                    parts.push(vs.iter().cloned().zip(r.iter().cloned()).collect());
+                }
+                parts
+            }
+            _ => return Err(mismatch()),
+        };
+        let mut next = Vec::with_capacity(envs.len() * parts.len());
+        for env in &envs {
+            'part: for part in &parts {
+                let mut e2 = env.clone();
+                for (k, v) in part {
+                    if !bind_var(&mut e2, k, v.clone()) {
+                        continue 'part;
+                    }
+                }
+                next.push(e2);
+            }
+        }
+        envs = next;
+    }
+    Ok(envs)
+}
+
+fn checked_num(r: Option<i64>, op: &str) -> Result<Value, DatalogError> {
+    r.map(Value::I64)
+        .ok_or_else(|| DatalogError::Function(format!("integer overflow in {op}")))
+}
+
+/// Arithmetic over `I64` and `F64` (mixed operands promote to `F64`). Integer `/` stays integral when exact.
+fn num_op(op: &str, a: &Value, b: &Value) -> Result<Value, DatalogError> {
+    let bad = || DatalogError::Function(format!("{op} expects numbers"));
+    match (a, b) {
+        (Value::I64(x), Value::I64(y)) => {
+            let (x, y) = (*x, *y);
+            if matches!(op, "quot" | "rem" | "mod" | "/") && y == 0 {
+                return Err(DatalogError::Function("division by zero".into()));
+            }
+            match op {
+                "+" => checked_num(x.checked_add(y), op),
+                "-" => checked_num(x.checked_sub(y), op),
+                "*" => checked_num(x.checked_mul(y), op),
+                "/" if x.checked_rem(y) == Some(0) => checked_num(x.checked_div(y), op),
+                "/" => Ok(Value::F64(x as f64 / y as f64)),
+                "quot" => checked_num(x.checked_div(y), op),
+                "rem" => checked_num(x.checked_rem(y), op),
+                "mod" => checked_num(x.checked_rem(y).map(|r| if r != 0 && (r < 0) != (y < 0) { r + y } else { r }), op),
+                _ => Err(bad()),
+            }
+        }
+        _ => {
+            let (x, y) = match (value_as_f64(a), value_as_f64(b)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => return Err(bad()),
+            };
+            Ok(Value::F64(match op {
+                "+" => x + y,
+                "-" => x - y,
+                "*" => x * y,
+                "/" => x / y,
+                "quot" => (x / y).trunc(),
+                "rem" => x % y,
+                "mod" => x - y * (x / y).floor(),
+                _ => return Err(bad()),
+            }))
+        }
+    }
+}
+
+fn check_arity(name: &str, args: &[Value], n: usize) -> Result<(), DatalogError> {
+    if args.len() != n {
+        return Err(DatalogError::Function(format!("{name} takes {n} arguments, got {}", args.len())));
+    }
+    Ok(())
+}
+
+impl Conn {
+    /// Resolves an entity argument: an entity id, or a `[attr value]` lookup ref. `None` if absent.
+    fn entity_arg(&self, rtxn: &ReadTxn<'_>, v: &Value) -> Result<Option<EntityId>, DatalogError> {
+        match v {
+            Value::Ref(e) => Ok(Some(*e)),
+            Value::I64(e) if *e >= 0 => Ok(Some(*e as EntityId)),
+            Value::Tuple(lr) if lr.len() == 2 => match &lr[0] {
+                Value::Keyword(a) => self.lookup_entity_by_av(rtxn, a, &lr[1]),
+                _ => Err(DatalogError::Function("lookup ref must start with an attribute keyword".into())),
+            },
+            _ => Err(DatalogError::Function(format!("not an entity: {v:?}"))),
+        }
+    }
+
+    fn attr_arg(v: &Value) -> Result<&str, DatalogError> {
+        match v {
+            Value::Keyword(a) => Ok(a.as_str()),
+            _ => Err(DatalogError::Function(format!("expected an attribute keyword, got {v:?}"))),
+        }
+    }
+
+    /// Evaluates a built-in query function. `None` means nil (the binding or filter fails).
+    fn call_fn(&self, rtxn: &ReadTxn<'_>, name: &str, args: &[Value]) -> Result<Option<Value>, DatalogError> {
+        Ok(match name {
+            "get-else" => {
+                check_arity(name, args, 3)?;
+                let v = match self.entity_arg(rtxn, &args[0])? {
+                    Some(e) => self.get_attr(rtxn, e, Self::attr_arg(&args[1])?)?,
+                    None => None,
+                };
+                Some(v.unwrap_or_else(|| args[2].clone()))
+            }
+            "get-some" => {
+                if args.len() < 2 {
+                    return Err(DatalogError::Function("get-some takes an entity and attributes".into()));
+                }
+                let mut found = None;
+                if let Some(e) = self.entity_arg(rtxn, &args[0])? {
+                    for a in &args[1..] {
+                        let attr = Self::attr_arg(a)?;
+                        if let Some(v) = self.get_attr(rtxn, e, attr)? {
+                            found = Some(Value::Tuple(vec![Value::Keyword(attr.to_owned()), v]));
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+            "missing?" => {
+                check_arity(name, args, 2)?;
+                let has = match self.entity_arg(rtxn, &args[0])? {
+                    Some(e) => self.get_attr(rtxn, e, Self::attr_arg(&args[1])?)?.is_some(),
+                    None => false,
+                };
+                Some(Value::Bool(!has))
+            }
+            "ground" => {
+                check_arity(name, args, 1)?;
+                Some(args[0].clone())
+            }
+            "tuple" => Some(Value::Tuple(args.to_vec())),
+            "untuple" => {
+                check_arity(name, args, 1)?;
+                match &args[0] {
+                    t @ Value::Tuple(_) => Some(t.clone()),
+                    _ => return Err(DatalogError::Function("untuple expects a tuple".into())),
+                }
+            }
+            "in" | "not-in" => {
+                check_arity(name, args, 2)?;
+                let coll = match &args[1] {
+                    Value::Tuple(c) => c,
+                    _ => return Err(DatalogError::Function(format!("{name} expects a collection"))),
+                };
+                let hit = coll.contains(&args[0]);
+                Some(Value::Bool(if name == "in" { hit } else { !hit }))
+            }
+            "inc" | "dec" => {
+                check_arity(name, args, 1)?;
+                let op = if name == "inc" { "+" } else { "-" };
+                Some(num_op(op, &args[0], &Value::I64(1))?)
+            }
+            "+" | "-" | "*" | "/" | "quot" | "rem" | "mod" => {
+                check_arity(name, args, 2)?;
+                Some(num_op(name, &args[0], &args[1])?)
+            }
+            other => return Err(DatalogError::Function(format!("unknown function: {other}"))),
+        })
     }
 }
 
@@ -1769,17 +2333,12 @@ pub struct PreparedQuery<'conn> {
 
 impl<'conn> PreparedQuery<'conn> {
     pub fn execute(&self, rtxn: &ReadTxn<'_>, inputs: &[Value]) -> Result<QueryResult, DatalogError> {
-        if self.parsed.in_vars.len() != inputs.len() {
-            return Err(DatalogError::Parse(ParseError::InvalidQuery(format!(
-                "expected {} :in arguments, got {}",
-                self.parsed.in_vars.len(),
-                inputs.len()
-            ))));
-        }
-        let mut init_env = HashMap::with_capacity(inputs.len());
-        for (var, val) in self.parsed.in_vars.iter().zip(inputs.iter()) {
-            init_env.insert(var.clone(), val.clone());
-        }
+        let typed: Vec<QueryInput> = inputs.iter().cloned().map(QueryInput::Scalar).collect();
+        self.execute_inputs(rtxn, &typed)
+    }
+
+    pub fn execute_inputs(&self, rtxn: &ReadTxn<'_>, inputs: &[QueryInput]) -> Result<QueryResult, DatalogError> {
+        let seed = seed_envs(&self.parsed.in_bindings, inputs)?;
         let rule_tables = if self.rule_map.is_empty() {
             HashMap::new()
         } else {
@@ -1787,7 +2346,7 @@ impl<'conn> PreparedQuery<'conn> {
         };
         let envs = self
             .conn
-            .eval_clauses(rtxn, &self.parsed.clauses, vec![init_env], &rule_tables)?;
+            .eval_clauses(rtxn, &self.parsed.clauses, seed, &rule_tables)?;
         self.conn.finalize_query_result(rtxn, &self.parsed, envs)
     }
 }
@@ -1813,6 +2372,311 @@ impl Conn {
             parsed: parsed_tmp,
             rule_map,
         })
+    }
+}
+
+impl Conn {
+    /// Largest entity id allocated so far (0 when none).
+    pub fn max_eid(&self, rtxn: &ReadTxn<'_>) -> Result<EntityId, DatalogError> {
+        Ok(match self.meta.get(rtxn, NEXT_EID_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()).saturating_sub(1),
+            _ => 0,
+        })
+    }
+
+    /// Number of distinct values stored for `attr`.
+    pub fn cardinality(&self, rtxn: &ReadTxn<'_>, attr: &str) -> Result<u64, DatalogError> {
+        let aid = self.attr_id(attr)?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for item in self.eav.iter(rtxn)? {
+            let (k, _) = item?;
+            if k.len() >= 12 && u32::from_be_bytes(k[8..12].try_into().unwrap()) == aid {
+                seen.insert(k[12..].to_vec());
+            }
+        }
+        Ok(seen.len() as u64)
+    }
+
+    /// Datoms for an indexed `attr` with value `<= start`, in descending value order.
+    pub fn rseek_datoms(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        attr: &str,
+        start: &Value,
+    ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
+        let aid = self.attr_id(attr)?;
+        let mut hi = Vec::with_capacity(32);
+        encode_av_prefix(aid, start, &mut hi);
+        hi.extend_from_slice(&[0xff; 8]);
+        let lo = aid.to_be_bytes();
+        let mut out = Vec::new();
+        for item in self.ave.range(
+            rtxn,
+            &(std::ops::Bound::Included(&lo[..]), std::ops::Bound::Included(hi.as_slice())),
+        )? {
+            let (k, _) = item?;
+            let eid = decode_ave_entity(&k)?;
+            let (raw_val, _) = dtlv_codec::decode_escaped_bytes(&k[4..k.len() - 8])?;
+            out.push((eid, attr.to_owned(), decode_value(&raw_val)?));
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Datoms matching the given components; `None` is a wildcard. Uses EAV for a bound entity,
+    /// AVE for an indexed `(attr, value)`, and a full EAV scan otherwise.
+    pub fn search_datoms(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        e: Option<EntityId>,
+        a: Option<&str>,
+        v: Option<&Value>,
+    ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
+        let aid = match a {
+            Some(name) => Some(self.attr_id(name)?),
+            None => None,
+        };
+        let mut out = Vec::new();
+        if let Some(eid) = e {
+            let mut pref = eid.to_be_bytes().to_vec();
+            if let Some(aid) = aid {
+                pref.extend_from_slice(&aid.to_be_bytes());
+            }
+            for item in self.eav.prefix_iter(rtxn, &pref)? {
+                let (k, _) = item?;
+                let kaid = u32::from_be_bytes(k[8..12].try_into().unwrap());
+                let val = decode_value(&k[12..])?;
+                if v.is_none_or(|x| *x == val) {
+                    if let Some(name) = self.aid_names.get(&kaid) {
+                        out.push((eid, name.clone(), val));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        let indexed_av = match (aid, v) {
+            (Some(aid), Some(val)) if self.attrs.get(&aid).is_some_and(|s| s.index) => Some((aid, val)),
+            _ => None,
+        };
+        if let Some((aid, val)) = indexed_av {
+            let mut pref = Vec::with_capacity(32);
+            encode_av_prefix(aid, val, &mut pref);
+            for item in self.ave.prefix_iter(rtxn, &pref)? {
+                let (k, _) = item?;
+                out.push((decode_ave_entity(&k)?, a.unwrap_or_default().to_owned(), val.clone()));
+            }
+            return Ok(out);
+        }
+        for (eid, name, val) in self.datoms(rtxn, IndexKind::Eavt)? {
+            if a.is_none_or(|x| x == name) && v.is_none_or(|x| *x == val) {
+                out.push((eid, name, val));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Datoms of fulltext-indexed attributes for the entities that match `query`, best match first.
+    pub fn fulltext_datoms(
+        &self,
+        rtxn: &ReadTxn<'_>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(EntityId, String, Value)>, DatalogError> {
+        let hits = self.fts.search(rtxn, query, limit)?;
+        let names: Vec<String> = self.attrs.values().filter(|s| s.fulltext).map(|s| s.name.clone()).collect();
+        let mut out = Vec::new();
+        for (eid, _) in hits {
+            for name in &names {
+                if let Some(val) = self.get_attr(rtxn, eid, name)? {
+                    out.push((eid, name.clone(), val));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `(eid, value, raw EAV key)` stored under `aid`, read inside a write transaction.
+    fn scan_attr_rw(
+        &self,
+        wtxn: &WriteTxn<'_>,
+        aid: AttrId,
+    ) -> Result<Vec<(EntityId, Value, Vec<u8>)>, DatalogError> {
+        let mut out = Vec::new();
+        for (k, _) in self.eav.iter_rw(wtxn)? {
+            if k.len() >= 12 && u32::from_be_bytes(k[8..12].try_into().unwrap()) == aid {
+                let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                out.push((eid, decode_value(&k[12..])?, k));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Adds attributes, deletes attributes (with their datoms), and renames attributes.
+    ///
+    /// Adding a name that already exists is a no-op when the spec is identical. An existing attribute
+    /// may only gain `index` or `fulltext`, which backfills existing datoms. Other property changes are
+    /// rejected. Renames keep the internal attribute id, so no datoms are rewritten. Validation runs
+    /// before any write, and in-memory state changes only after the commit succeeds.
+    pub fn update_schema(
+        &mut self,
+        add: Vec<AttrSpec>,
+        del: &[&str],
+        rename: &[(&str, &str)],
+    ) -> Result<(), DatalogError> {
+        for name in del {
+            let aid = self.attr_id(name)?;
+            if self.tuple_specs.iter().any(|(_, _, srcs)| srcs.contains(&aid)) {
+                return Err(DatalogError::Schema(format!("{name} is a source of a tuple attribute")));
+            }
+        }
+        for (old, new) in rename {
+            self.attr_id(old)?;
+            let clashes = self.attr_ids.contains_key(*new)
+                || add.iter().any(|s| s.name == *new)
+                || rename.iter().filter(|(_, n)| n == new).count() > 1;
+            if clashes || del.contains(old) {
+                return Err(DatalogError::Schema(format!("cannot rename {old} to {new}")));
+            }
+        }
+        // Each add: (spec, existing aid if the attribute already exists and needs an index/fulltext backfill)
+        let mut plan: Vec<(AttrSpec, Option<AttrId>)> = Vec::new();
+        for spec in add {
+            if spec.tuple_sources.is_some() {
+                return Err(DatalogError::Schema(format!(
+                    "tuple attribute {} must be declared when the connection is opened",
+                    spec.name
+                )));
+            }
+            match self.attr_ids.get(&spec.name).copied() {
+                None => plan.push((spec, None)),
+                Some(aid) => {
+                    let old = self.attrs.get(&aid).cloned().unwrap_or_else(|| AttrSpec::new(spec.name.clone()));
+                    if old.cardinality == spec.cardinality
+                        && old.unique == spec.unique
+                        && old.is_component == spec.is_component
+                        && old.tuple_sources == spec.tuple_sources
+                        && (!old.index || spec.index)
+                        && (!old.fulltext || spec.fulltext)
+                    {
+                        if old.index != spec.index || old.fulltext != spec.fulltext {
+                            plan.push((spec, Some(aid)));
+                        }
+                    } else if old.cardinality != spec.cardinality
+                        || old.unique != spec.unique
+                        || old.is_component != spec.is_component
+                        || old.tuple_sources != spec.tuple_sources
+                        || old.index != spec.index && !spec.index
+                        || old.fulltext != spec.fulltext && !spec.fulltext
+                    {
+                        return Err(DatalogError::Schema(format!(
+                            "cannot change the properties of existing attribute {}",
+                            spec.name
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut wtxn = self.store.write_txn()?;
+        let mut next_aid = match self.meta.get_rw(&wtxn, NEXT_AID_KEY)? {
+            Some(b) if b.len() == 4 => u32::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 1,
+        };
+        let mut ave_buf = Vec::new();
+
+        // Deletes: drop every datom of the attribute, then its schema entry.
+        for name in del {
+            let aid = self.attr_ids[*name];
+            let spec = self.attrs.get(&aid).cloned();
+            for (eid, val, key) in self.scan_attr_rw(&wtxn, aid)? {
+                self.eav.delete(&mut wtxn, &key)?;
+                if spec.as_ref().is_some_and(|s| s.index) {
+                    encode_ave_key(aid, &val, eid, &mut ave_buf);
+                    self.ave.delete(&mut wtxn, &ave_buf)?;
+                }
+                if let Value::Ref(target) = val {
+                    encode_vae_key(target, aid, eid, &mut ave_buf);
+                    self.vae.delete(&mut wtxn, &ave_buf)?;
+                }
+                if spec.as_ref().is_some_and(|s| s.fulltext) {
+                    self.fts.remove_doc(&mut wtxn, eid)?;
+                }
+            }
+            let mut key = b"attr:".to_vec();
+            key.extend_from_slice(name.as_bytes());
+            self.meta.delete(&mut wtxn, &key)?;
+        }
+
+        // Renames: move the name mapping; the id and datoms stay put.
+        for (old, new) in rename {
+            let aid = self.attr_ids[*old];
+            let mut old_key = b"attr:".to_vec();
+            old_key.extend_from_slice(old.as_bytes());
+            self.meta.delete(&mut wtxn, &old_key)?;
+            let mut new_key = b"attr:".to_vec();
+            new_key.extend_from_slice(new.as_bytes());
+            self.meta.put(&mut wtxn, &new_key, &aid.to_be_bytes())?;
+        }
+
+        // Adds: new attributes get fresh ids; upgrades backfill their index or fulltext entries.
+        let mut new_entries: Vec<(AttrId, AttrSpec)> = Vec::new();
+        for (spec, existing) in &plan {
+            let aid = match existing {
+                Some(aid) => *aid,
+                None => {
+                    let aid = next_aid;
+                    next_aid += 1;
+                    let mut key = b"attr:".to_vec();
+                    key.extend_from_slice(spec.name.as_bytes());
+                    self.meta.put(&mut wtxn, &key, &aid.to_be_bytes())?;
+                    aid
+                }
+            };
+            if existing.is_some() {
+                for (eid, val, _) in self.scan_attr_rw(&wtxn, aid)? {
+                    if spec.index {
+                        encode_ave_key(aid, &val, eid, &mut ave_buf);
+                        self.ave.put(&mut wtxn, &ave_buf, &[])?;
+                    }
+                    if spec.fulltext {
+                        if let Some(text) = val.as_str() {
+                            self.fts.index_doc(&mut wtxn, eid, text)?;
+                        }
+                    }
+                }
+            }
+            new_entries.push((aid, spec.clone()));
+        }
+        self.meta.put(&mut wtxn, NEXT_AID_KEY, &next_aid.to_be_bytes())?;
+        wtxn.commit()?;
+
+        // Commit succeeded: mirror the change in memory.
+        for name in del {
+            let aid = self.attr_ids.remove(*name).expect("validated above");
+            self.aid_names.remove(&aid);
+            self.attrs.remove(&aid);
+            self.tuple_specs.retain(|(_, t, _)| *t != aid);
+            self.tuple_targets.remove(&aid);
+        }
+        for (old, new) in rename {
+            let aid = self.attr_ids.remove(*old).expect("validated above");
+            self.attr_ids.insert((*new).to_owned(), aid);
+            self.aid_names.insert(aid, (*new).to_owned());
+            if let Some(spec) = self.attrs.get_mut(&aid) {
+                spec.name = (*new).to_owned();
+            }
+            for entry in &mut self.tuple_specs {
+                if entry.1 == aid {
+                    entry.0 = (*new).to_owned();
+                }
+            }
+        }
+        for (aid, spec) in new_entries {
+            self.attr_ids.insert(spec.name.clone(), aid);
+            self.aid_names.insert(aid, spec.name.clone());
+            self.attrs.insert(aid, spec);
+        }
+        Ok(())
     }
 }
 

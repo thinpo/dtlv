@@ -223,6 +223,42 @@ pub enum CmpOp {
     Eq,
     Ne,
     Like,
+    NotLike,
+}
+
+/// Output binding of a function clause: `[(f ...) ?x]`, `[(f ...) [?a ?b]]`, or a bare filter `[(f ...)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnOut {
+    None,
+    Var(String),
+    Tuple(Vec<String>),
+}
+
+/// One `:in` input binding: `?x`, `[?x ...]`, `[?a ?b]`, or `[[?a ?b] ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InBinding {
+    Scalar(String),
+    Coll(String),
+    Tuple(Vec<String>),
+    Rel(Vec<String>),
+}
+
+impl InBinding {
+    pub fn vars(&self) -> Vec<String> {
+        match self {
+            InBinding::Scalar(v) | InBinding::Coll(v) => vec![v.clone()],
+            InBinding::Tuple(vs) | InBinding::Rel(vs) => vs.clone(),
+        }
+    }
+}
+
+/// A runtime value supplied for an `:in` binding.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryInput {
+    Scalar(Value),
+    Coll(Vec<Value>),
+    Tuple(Vec<Value>),
+    Rel(Vec<Vec<Value>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,14 +279,22 @@ pub enum Clause {
     Pred(CmpOp, ExprTerm, ExprTerm),
     Fulltext(ExprTerm, String), // (query_term, entity_var)
     Or(Vec<Vec<Clause>>),
+    /// `(or-join [?join ...] branch ...)`: branches may bind only the join vars into the outer scope.
+    OrJoin(Vec<String>, Vec<Vec<Clause>>),
     Not(Vec<Clause>),
+    /// `(not-join [?join ...] clause ...)`: clauses see only the join vars from the outer scope.
+    NotJoin(Vec<String>, Vec<Clause>),
     RuleCall(String, Vec<ExprTerm>),
+    /// Built-in function call: `[(get-else $ ?e :a 0) ?v]` or `[(missing? $ ?e :a)]`.
+    Fn(String, Vec<ExprTerm>, FnOut),
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     pub find: Vec<FindElem>,
     pub find_spec: FindSpec,
+    pub in_bindings: Vec<InBinding>,
+    /// Flattened variables of `in_bindings`, in declaration order.
     pub in_vars: Vec<String>,
     pub clauses: Vec<Clause>,
     pub order_by: Vec<OrderSpec>,
@@ -282,8 +326,104 @@ fn edn_to_term(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Exp
         Edn::Int(i) => Ok(ExprTerm::Val(Value::I64(*i))),
         Edn::Float(f) => Ok(ExprTerm::Val(Value::F64(*f))),
         Edn::Bool(b) => Ok(ExprTerm::Val(Value::Bool(*b))),
+        // Literal collection, e.g. `["Smith" "Doe"]` as a function argument.
+        Edn::Vec(items) => {
+            let vals = items
+                .iter()
+                .map(|i| match edn_to_term(i, in_map)? {
+                    ExprTerm::Val(v) => Ok(v),
+                    _ => Err(ParseError::InvalidQuery("collection literals may contain only constants".into())),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ExprTerm::Val(Value::Tuple(vals)))
+        }
         other => Err(ParseError::InvalidQuery(format!("unexpected term: {:?}", other))),
     }
+}
+
+/// Function-call clause: `(f args...)` with an optional output binding item.
+fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String, Value>>) -> Result<Clause, ParseError> {
+    let name = match &inner[0] {
+        Edn::Symbol(s) => s.clone(),
+        _ => return Err(ParseError::InvalidQuery("function name must be a symbol".into())),
+    };
+    const KNOWN_FNS: &[&str] = &[
+        "get-else", "get-some", "missing?", "ground", "tuple", "untuple", "in", "not-in", "inc", "dec", "+", "-",
+        "*", "/", "quot", "rem", "mod",
+    ];
+    if !KNOWN_FNS.contains(&name.as_str()) {
+        return Err(ParseError::InvalidQuery(format!("unknown predicate or function: {name}")));
+    }
+    // Datalevin built-ins take the database as their first argument; the sole database is `$`.
+    let args_edn = match inner.get(1) {
+        Some(Edn::Symbol(s)) if s == "$" => &inner[2..],
+        _ => &inner[1..],
+    };
+    let args = args_edn
+        .iter()
+        .map(|a| edn_to_term(a, in_map))
+        .collect::<Result<Vec<_>, _>>()?;
+    let out = match items.get(1) {
+        None => FnOut::None,
+        Some(Edn::Symbol(s)) if s == "_" => FnOut::None,
+        Some(Edn::Symbol(s)) if s.starts_with('?') => FnOut::Var(s.clone()),
+        Some(Edn::Vec(vs)) => FnOut::Tuple(
+            vs.iter()
+                .map(|v| match v {
+                    Edn::Symbol(s) if s.starts_with('?') => Ok(s.clone()),
+                    _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars".into())),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(other) => return Err(ParseError::InvalidQuery(format!("invalid function output: {:?}", other))),
+    };
+    if items.len() > 2 {
+        return Err(ParseError::InvalidQuery("function clause has too many elements".into()));
+    }
+    Ok(Clause::Fn(name, args, out))
+}
+
+/// Parses the `[?v ...]` join-variable list of `or-join` / `not-join`.
+fn join_vars(edn: &Edn) -> Result<Vec<String>, ParseError> {
+    match edn {
+        Edn::Vec(items) => items
+            .iter()
+            .map(|i| match i {
+                Edn::Symbol(s) if s.starts_with('?') => Ok(s.clone()),
+                _ => Err(ParseError::InvalidQuery("join variables must be ?vars".into())),
+            })
+            .collect(),
+        _ => Err(ParseError::InvalidQuery("join variables must be a vector".into())),
+    }
+}
+
+/// Parse one `:in` item: `?x`, `[?x ...]`, `[?a ?b]`, or `[[?a ?b] ...]`.
+fn parse_in_binding(edn: &Edn) -> Result<Option<InBinding>, ParseError> {
+    fn vars_of(items: &[Edn]) -> Result<Vec<String>, ParseError> {
+        items
+            .iter()
+            .map(|i| match i {
+                Edn::Symbol(s) if s.starts_with('?') => Ok(s.clone()),
+                _ => Err(ParseError::InvalidQuery("bindings must be ?vars".into())),
+            })
+            .collect()
+    }
+    let dots = Edn::Symbol("...".into());
+    Ok(Some(match edn {
+        // Database and rules inputs are not data bindings.
+        Edn::Symbol(s) if s == "$" || s == "%" => return Ok(None),
+        Edn::Symbol(s) if s.starts_with('?') => InBinding::Scalar(s.clone()),
+        Edn::Vec(items) => match items.as_slice() {
+            [v, d] if *d == dots => {
+                let mut vs = vars_of(std::slice::from_ref(v))?;
+                InBinding::Coll(vs.remove(0))
+            }
+            [Edn::Vec(row), d] if *d == dots => InBinding::Rel(vars_of(row)?),
+            [Edn::Vec(row)] => InBinding::Rel(vars_of(row)?),
+            other => InBinding::Tuple(vars_of(other)?),
+        },
+        other => return Err(ParseError::InvalidQuery(format!("invalid :in binding: {:?}", other))),
+    }))
 }
 
 fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Clause, ParseError> {
@@ -328,7 +468,8 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                         "=" => CmpOp::Eq,
                         "!=" | "not=" => CmpOp::Ne,
                         "like" => CmpOp::Like,
-                        _ => return Err(ParseError::InvalidQuery(format!("unknown predicate: {}", op))),
+                        "not-like" => CmpOp::NotLike,
+                        _ => return parse_fn_clause(inner, items, in_map),
                     };
                     if inner.len() != 3 {
                         return Err(ParseError::InvalidQuery("predicate requires 2 args".into()));
@@ -395,7 +536,7 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                             other => branches.push(vec![parse_clause(other, in_map)?]),
                         }
                     }
-                    Ok(Clause::Or(branches))
+                    Ok(Clause::OrJoin(join_vars(&items[1])?, branches))
                 }
                 "not" => {
                     let mut cs = Vec::new();
@@ -413,7 +554,7 @@ fn parse_clause(edn: &Edn, in_map: Option<&HashMap<String, Value>>) -> Result<Cl
                     for c in &items[2..] {
                         cs.push(parse_clause(c, in_map)?);
                     }
-                    Ok(Clause::Not(cs))
+                    Ok(Clause::NotJoin(join_vars(&items[1])?, cs))
                 }
                 rule_name => {
                     let mut args = Vec::new();
@@ -535,11 +676,11 @@ fn parse_find_items(items: &[Edn], find: &mut Vec<FindElem>, find_spec: &mut Fin
     Ok(())
 }
 
-fn parse_query_impl(input: &str, inputs: Option<&[Value]>) -> Result<ParsedQuery, ParseError> {
+fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<ParsedQuery, ParseError> {
     let edn = parse_edn(input)?;
     let mut find = Vec::new();
     let mut find_spec = FindSpec::Rel;
-    let mut in_vars = Vec::new();
+    let mut in_bindings: Vec<InBinding> = Vec::new();
     let mut where_edns = Vec::new();
     let mut order_by = Vec::new();
     let mut limit = None;
@@ -574,10 +715,8 @@ fn parse_query_impl(input: &str, inputs: Option<&[Value]>) -> Result<ParsedQuery
                 match section {
                     "find" => find_edns.push(items[i].clone()),
                     "in" => {
-                        if let Edn::Symbol(s) = &items[i] {
-                            if s != "$" && s != "%" && s.starts_with('?') {
-                                in_vars.push(s.clone());
-                            }
+                        if let Some(b) = parse_in_binding(&items[i])? {
+                            in_bindings.push(b);
                         }
                     }
                     "where" => where_edns.push(items[i].clone()),
@@ -618,10 +757,8 @@ fn parse_query_impl(input: &str, inputs: Option<&[Value]>) -> Result<ParsedQuery
                     ":in" => {
                         if let Edn::Vec(items) = v {
                             for item in items {
-                                if let Edn::Symbol(s) = item {
-                                    if s != "$" && s != "%" && s.starts_with('?') {
-                                        in_vars.push(s);
-                                    }
+                                if let Some(b) = parse_in_binding(&item)? {
+                                    in_bindings.push(b);
                                 }
                             }
                         }
@@ -672,15 +809,23 @@ fn parse_query_impl(input: &str, inputs: Option<&[Value]>) -> Result<ParsedQuery
         return Err(ParseError::InvalidQuery("missing :find clause".into()));
     }
 
+    let in_vars: Vec<String> = in_bindings.iter().flat_map(|b| b.vars()).collect();
+    // Scalars are substituted into the clauses at parse time; other shapes are seeded at execution.
     let in_map = if let Some(vals) = inputs {
-        if in_vars.len() != vals.len() {
+        if in_bindings.len() != vals.len() {
             return Err(ParseError::InvalidQuery(format!(
                 "expected {} :in arguments, got {}",
-                in_vars.len(),
+                in_bindings.len(),
                 vals.len()
             )));
         }
-        Some(in_vars.iter().cloned().zip(vals.iter().cloned()).collect::<HashMap<_, _>>())
+        let mut m = HashMap::new();
+        for (b, v) in in_bindings.iter().zip(vals.iter()) {
+            if let (InBinding::Scalar(name), QueryInput::Scalar(val)) = (b, v) {
+                m.insert(name.clone(), val.clone());
+            }
+        }
+        Some(m)
     } else {
         None
     };
@@ -693,6 +838,7 @@ fn parse_query_impl(input: &str, inputs: Option<&[Value]>) -> Result<ParsedQuery
     Ok(ParsedQuery {
         find,
         find_spec,
+        in_bindings,
         in_vars,
         clauses,
         order_by,
@@ -707,6 +853,11 @@ pub fn parse_query_template(input: &str) -> Result<ParsedQuery, ParseError> {
 }
 
 pub fn parse_query(input: &str, inputs: &[Value]) -> Result<ParsedQuery, ParseError> {
+    let typed: Vec<QueryInput> = inputs.iter().cloned().map(QueryInput::Scalar).collect();
+    parse_query_impl(input, Some(&typed))
+}
+
+pub fn parse_query_inputs(input: &str, inputs: &[QueryInput]) -> Result<ParsedQuery, ParseError> {
     parse_query_impl(input, Some(inputs))
 }
 
