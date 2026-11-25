@@ -24,7 +24,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
 | Query | nested queries, UDFs | todo |
 | Entity API | `rseek_datoms`, `search_datoms`, `fulltext_datoms`, `cardinality`, `max_eid` | done |
-| Entity API | lazy `entity` / `touch` (pull covers reads) | todo |
+| Entity API | read-only `entity` views: `get`, `touch`, `entity_by_lookup` (cardinality-many as tuples) | done |
+| Entity API | transactable entities (`assoc`/`dissoc` builders) | todo |
 | Listeners | `listen`/`unlisten` with a `TxReport` of added and retracted datoms, delivered after commit | done |
 | Listeners | `listen-db!` (per-database listeners) | todo |
 | Bulk load | `load_datoms`: one transaction, all-or-nothing | done |

@@ -1,5 +1,8 @@
 pub mod parser;
 mod idoc;
+mod entity;
+
+pub use entity::Entity;
 mod wal;
 
 pub use wal::{read_records as read_wal_records, Durability};
