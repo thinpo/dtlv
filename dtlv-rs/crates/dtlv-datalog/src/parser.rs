@@ -235,7 +235,8 @@ pub enum CmpOp {
 pub enum FnOut {
     None,
     Var(String),
-    Tuple(Vec<String>),
+    /// One entry per tuple position; `None` is an ignored (`_`) position.
+    Tuple(Vec<Option<String>>),
 }
 
 /// One `:in` input binding: `?x`, `[?x ...]`, `[?a ?b]`, or `[[?a ?b] ...]`.
@@ -494,11 +495,9 @@ fn parse_fn_clause(inner: &[Edn], items: &[Edn], in_map: Option<&HashMap<String,
         Some(Edn::Symbol(s)) if s.starts_with('?') => FnOut::Var(s.clone()),
         Some(Edn::Vec(vs)) => FnOut::Tuple(
             vs.iter()
-                .enumerate()
-                .map(|(i, v)| match v {
-                    Edn::Symbol(s) if s.starts_with('?') => Ok(s.clone()),
-                    // `_` binds to a throwaway variable that no clause reads.
-                    Edn::Symbol(s) if s == "_" => Ok(format!("?_ignored{i}")),
+                .map(|v| match v {
+                    Edn::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
+                    Edn::Symbol(s) if s == "_" => Ok(None),
                     _ => Err(ParseError::InvalidQuery("tuple binding must list ?vars or _".into())),
                 })
                 .collect::<Result<Vec<_>, _>>()?,

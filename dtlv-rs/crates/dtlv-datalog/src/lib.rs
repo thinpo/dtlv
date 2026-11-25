@@ -2112,7 +2112,11 @@ impl Conn {
                                         xs.len()
                                     )));
                                 }
-                                if xs.iter().zip(vs).all(|(x, v)| bind_var(&mut env, x, v)) {
+                                // Ignored (`_`) positions bind nothing, so they never constrain other values.
+                                if xs.iter().zip(vs).all(|(x, v)| match x {
+                                    Some(var) => bind_var(&mut env, var, v),
+                                    None => true,
+                                }) {
                                     next_envs.push(env);
                                 }
                             }

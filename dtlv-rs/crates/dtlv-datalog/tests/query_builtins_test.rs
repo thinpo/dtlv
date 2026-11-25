@@ -309,3 +309,20 @@ fn get_some_else_returns_default_when_no_attribute_present() {
     );
     assert_eq!(r, vec![vec![s("N/A")]]);
 }
+
+#[test]
+fn ignored_tuple_positions_never_constrain_each_other() {
+    let conn = conn();
+    let rtxn = conn.read_txn().unwrap();
+    // Both `_` positions hold different values (1 and 3). They are discarded, so they must not
+    // be unified with each other, and the row must survive.
+    let r = rows(
+        conn.q_str(
+            &rtxn,
+            r#"[:find ?a ?b :where [(tuple 1 2) [_ ?a]] [(tuple 3 4) [_ ?b]]]"#,
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(r, vec![vec![Value::I64(2), Value::I64(4)]]);
+}
