@@ -13,7 +13,7 @@ use std::path::Path;
 
 use dtlv_codec::{decode_value, encode_value, Value};
 
-use crate::{EntityRef, TxItem, TxVal};
+use crate::{EntityRef, PatchOp, PathSeg, TxItem, TxVal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
@@ -135,8 +135,82 @@ fn encode_item(out: &mut Vec<u8>, item: &TxItem) {
             put_value(out, old);
             put_value(out, new);
         }
+        TxItem::PatchIdoc(e, a, ops) => {
+            out.push(6);
+            out.extend_from_slice(&e.to_be_bytes());
+            put_bytes(out, a.as_bytes());
+            out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+            for op in ops {
+                encode_patch_op(out, op);
+            }
+        }
         // Calls are expanded before logging; a logged `Call` would have no replayable meaning.
         TxItem::Call(..) => unreachable!("transaction calls are logged as the items they produced"),
+    }
+}
+
+fn put_path(out: &mut Vec<u8>, path: &[PathSeg]) {
+    out.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    for seg in path {
+        match seg {
+            PathSeg::Key(k) => {
+                out.push(0);
+                put_bytes(out, k.as_bytes());
+            }
+            PathSeg::Index(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_be_bytes());
+            }
+        }
+    }
+}
+
+fn put_json(out: &mut Vec<u8>, v: &serde_json::Value) {
+    put_bytes(out, serde_json::to_string(v).unwrap_or_default().as_bytes());
+}
+
+fn encode_patch_op(out: &mut Vec<u8>, op: &PatchOp) {
+    match op {
+        PatchOp::Set(p, v) => {
+            out.push(0);
+            put_path(out, p);
+            put_json(out, v);
+        }
+        PatchOp::Unset(p) => {
+            out.push(1);
+            put_path(out, p);
+        }
+        PatchOp::Conj(p, v) => {
+            out.push(2);
+            put_path(out, p);
+            put_json(out, v);
+        }
+        PatchOp::Merge(p, v) => {
+            out.push(3);
+            put_path(out, p);
+            put_json(out, v);
+        }
+        PatchOp::Assoc(p, k, v) => {
+            out.push(4);
+            put_path(out, p);
+            put_bytes(out, k.as_bytes());
+            put_json(out, v);
+        }
+        PatchOp::Dissoc(p, k) => {
+            out.push(5);
+            put_path(out, p);
+            put_bytes(out, k.as_bytes());
+        }
+        PatchOp::Inc(p, n) => {
+            out.push(6);
+            put_path(out, p);
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        PatchOp::Dec(p, n) => {
+            out.push(7);
+            put_path(out, p);
+            out.extend_from_slice(&n.to_be_bytes());
+        }
     }
 }
 
@@ -201,6 +275,37 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn path(&mut self) -> DecodeResult<Vec<PathSeg>> {
+        let n = self.u32()?;
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            out.push(match self.u8()? {
+                0 => PathSeg::Key(self.string()?),
+                1 => PathSeg::Index(self.u32()?),
+                t => return Err(format!("bad path segment tag {t}")),
+            });
+        }
+        Ok(out)
+    }
+
+    fn json(&mut self) -> DecodeResult<serde_json::Value> {
+        serde_json::from_slice(self.bytes()?).map_err(|e| e.to_string())
+    }
+
+    fn patch_op(&mut self) -> DecodeResult<PatchOp> {
+        Ok(match self.u8()? {
+            0 => PatchOp::Set(self.path()?, self.json()?),
+            1 => PatchOp::Unset(self.path()?),
+            2 => PatchOp::Conj(self.path()?, self.json()?),
+            3 => PatchOp::Merge(self.path()?, self.json()?),
+            4 => PatchOp::Assoc(self.path()?, self.string()?, self.json()?),
+            5 => PatchOp::Dissoc(self.path()?, self.string()?),
+            6 => PatchOp::Inc(self.path()?, self.u64()? as i64),
+            7 => PatchOp::Dec(self.path()?, self.u64()? as i64),
+            t => return Err(format!("bad patch op tag {t}")),
+        })
+    }
+
     fn item(&mut self) -> DecodeResult<TxItem> {
         Ok(match self.u8()? {
             0 => {
@@ -228,6 +333,16 @@ impl<'a> Reader<'a> {
             3 => TxItem::RetractAttribute(self.u64()?, self.string()?),
             4 => TxItem::RetractEntity(self.u64()?),
             5 => TxItem::Cas(self.u64()?, self.string()?, self.value()?, self.value()?),
+            6 => {
+                let e = self.u64()?;
+                let a = self.string()?;
+                let n = self.u32()?;
+                let mut ops = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    ops.push(self.patch_op()?);
+                }
+                TxItem::PatchIdoc(e, a, ops)
+            }
             t => return Err(format!("bad item tag {t}")),
         })
     }
@@ -526,6 +641,20 @@ mod tests {
             TxItem::RetractAttribute(6, ":w/tags".into()),
             TxItem::RetractEntity(8),
             TxItem::Cas(9, ":w/n".into(), Value::I64(1), Value::I64(2)),
+            TxItem::PatchIdoc(
+                11,
+                ":w/doc".into(),
+                vec![
+                    PatchOp::Set(vec![PathSeg::Key("a".into()), PathSeg::Index(2)], serde_json::json!({"x": [1, null]})),
+                    PatchOp::Unset(vec![PathSeg::Key("b".into())]),
+                    PatchOp::Conj(vec![], serde_json::json!("c")),
+                    PatchOp::Merge(vec![], serde_json::json!({"m": 1})),
+                    PatchOp::Assoc(vec![], "k".into(), serde_json::json!(true)),
+                    PatchOp::Dissoc(vec![], "d".into()),
+                    PatchOp::Inc(vec![PathSeg::Index(0)], -4),
+                    PatchOp::Dec(vec![PathSeg::Index(0)], 9),
+                ],
+            ),
         ];
         let (mut log, _) = Wal::open(&log_path, Durability::Relaxed, 0).unwrap();
         let lsn = log.append(&items).unwrap();

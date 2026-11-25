@@ -4,7 +4,7 @@ mod wal;
 
 pub use wal::{read_records as read_wal_records, Durability};
 
-pub use idoc::{idoc_get, idoc_value, pattern_predicates, PathSeg, JSON_NULL};
+pub use idoc::{apply_patch, idoc_get, idoc_value, pattern_predicates, PatchOp, PathSeg, JSON_NULL};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -201,6 +201,8 @@ pub enum TxItem {
     RetractAttribute(EntityId, String),
     /// Runs a registered transaction function; its returned items are applied in the same transaction.
     Call(String, Vec<Value>),
+    /// `:db.fn/patchIdoc`: applies operations to the current document of a cardinality-one idoc attribute.
+    PatchIdoc(EntityId, String, Vec<PatchOp>),
 }
 
 /// Read view handed to a transaction function. Sees the in-progress transaction.
@@ -1316,6 +1318,21 @@ impl Conn {
                     });
                 }
                 self.assert_datom(wtxn, *eid, attr_name, new_val, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                st.touched.push(*eid);
+            }
+            TxItem::PatchIdoc(eid, attr_name, ops) => {
+                self.reject_tuple_writes([attr_name.as_str()])?;
+                let aid = self.attr_id(attr_name)?;
+                if !self.attrs.get(&aid).is_some_and(|s| s.idoc && s.cardinality == Cardinality::One) {
+                    return Err(DatalogError::Type(format!("{attr_name} is not a cardinality-one idoc attribute")));
+                }
+                let current = match self.get_attr_rw(&*wtxn, *eid, aid)? {
+                    Some(Value::Doc(text)) => text,
+                    _ => return Err(DatalogError::Type(format!("entity {eid} has no {attr_name} document"))),
+                };
+                let patched = Value::Doc(apply_patch(&current, ops)?);
+                // Cardinality one: assert_datom retracts the old document and indexes the new one.
+                self.assert_datom(wtxn, *eid, attr_name, &patched, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
                 st.touched.push(*eid);
             }
             TxItem::Call(name, args) => {

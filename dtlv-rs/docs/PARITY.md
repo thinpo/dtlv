@@ -47,7 +47,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Vector | incremental graph maintenance, persisted graph, quantization, checkpoints, `vec-neighbors` in query | todo |
 | Idoc | JSON documents, path index (concrete, collapsed, wildcard forms), `idoc_match` (conjunctive), `idoc_get` | done (JSON, sync indexing) |
 | Idoc | `idoc-match` clause in Datalog queries (`[(idoc-match $ :attr {...}) [[?e ?a ?v]]]`, literal or bound pattern values) | done |
-| Idoc | EDN/Markdown formats, domains and `indexed-paths`/`excluded-paths`, `:db.fn/patchIdoc`, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
+| Idoc | `:db.fn/patchIdoc` (set, unset, conj, merge, assoc, dissoc, inc, dec) on cardinality-one attributes, atomic with the transaction and logged to the WAL | done |
+| Idoc | EDN/Markdown formats, domains and `indexed-paths`/`excluded-paths`, patch on cardinality-many attributes, async indexing, `:db/noindex`, mixed index+wildcard paths, array values in patterns | todo |
 | Codecs | nippy, bits, zstd dictionary compression, CSV, Hu-Tucker keys, roaring | todo (in `datalevin/src/rust`) |
 
 ## Behavioral notes

@@ -278,3 +278,123 @@ impl Conn {
         Ok(out)
     }
 }
+
+/// One `:db.fn/patchIdoc` operation. Paths address existing containers, except that `Set` and `Assoc` may
+/// add a new map key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchOp {
+    /// Replace the value at a path (an empty path replaces the whole document).
+    Set(Vec<PathSeg>, Json),
+    /// Remove a map key or vector element. Absent keys are ignored.
+    Unset(Vec<PathSeg>),
+    /// Append to the vector at a path.
+    Conj(Vec<PathSeg>, Json),
+    /// Merge a map into the map at a path.
+    Merge(Vec<PathSeg>, Json),
+    /// Set one key of the map at a path.
+    Assoc(Vec<PathSeg>, String, Json),
+    /// Remove one key of the map at a path.
+    Dissoc(Vec<PathSeg>, String),
+    /// Add an integer to the number at a path.
+    Inc(Vec<PathSeg>, i64),
+    /// Subtract an integer from the number at a path.
+    Dec(Vec<PathSeg>, i64),
+}
+
+fn patch_err(msg: impl Into<String>) -> DatalogError {
+    DatalogError::Type(format!("patchIdoc: {}", msg.into()))
+}
+
+fn navigate<'a>(root: &'a mut Json, path: &[PathSeg]) -> Result<&'a mut Json, DatalogError> {
+    let mut cur = root;
+    for seg in path {
+        cur = match (seg, cur) {
+            (PathSeg::Key(k), Json::Object(m)) => m.get_mut(k).ok_or_else(|| patch_err(format!("no key {k}")))?,
+            (PathSeg::Index(i), Json::Array(a)) => {
+                a.get_mut(*i as usize).ok_or_else(|| patch_err(format!("no index {i}")))?
+            }
+            _ => return Err(patch_err("path does not match the document shape")),
+        };
+    }
+    Ok(cur)
+}
+
+fn apply_op(doc: &mut Json, op: &PatchOp) -> Result<(), DatalogError> {
+    match op {
+        PatchOp::Set(path, v) => match path.split_last() {
+            None => *doc = v.clone(),
+            Some((last, parent_path)) => {
+                let parent = navigate(doc, parent_path)?;
+                match (last, parent) {
+                    (PathSeg::Key(k), Json::Object(m)) => {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    (PathSeg::Index(i), Json::Array(a)) if (*i as usize) < a.len() => a[*i as usize] = v.clone(),
+                    _ => return Err(patch_err("set target does not exist")),
+                }
+            }
+        },
+        PatchOp::Unset(path) => {
+            if let Some((last, parent_path)) = path.split_last() {
+                match (last, navigate(doc, parent_path)?) {
+                    (PathSeg::Key(k), Json::Object(m)) => {
+                        m.remove(k);
+                    }
+                    (PathSeg::Index(i), Json::Array(a)) => {
+                        if (*i as usize) < a.len() {
+                            a.remove(*i as usize);
+                        }
+                    }
+                    _ => return Err(patch_err("unset target has the wrong shape")),
+                }
+            } else {
+                return Err(patch_err("cannot unset the whole document"));
+            }
+        }
+        PatchOp::Conj(path, v) => match navigate(doc, path)? {
+            Json::Array(a) => a.push(v.clone()),
+            _ => return Err(patch_err("conj target is not a vector")),
+        },
+        PatchOp::Merge(path, v) => match (navigate(doc, path)?, v) {
+            (Json::Object(m), Json::Object(add)) => {
+                for (k, val) in add {
+                    m.insert(k.clone(), val.clone());
+                }
+            }
+            _ => return Err(patch_err("merge needs a map target and a map value")),
+        },
+        PatchOp::Assoc(path, k, v) => match navigate(doc, path)? {
+            Json::Object(m) => {
+                m.insert(k.clone(), v.clone());
+            }
+            _ => return Err(patch_err("assoc target is not a map")),
+        },
+        PatchOp::Dissoc(path, k) => match navigate(doc, path)? {
+            Json::Object(m) => {
+                m.remove(k);
+            }
+            _ => return Err(patch_err("dissoc target is not a map")),
+        },
+        PatchOp::Inc(path, n) | PatchOp::Dec(path, n) => {
+            let delta = if matches!(op, PatchOp::Inc(..)) { *n } else { n.checked_neg().ok_or_else(|| patch_err("overflow"))? };
+            let target = navigate(doc, path)?;
+            let cur = target.as_i64().ok_or_else(|| patch_err("inc/dec target is not an integer"))?;
+            let next = cur.checked_add(delta).ok_or_else(|| patch_err("integer overflow"))?;
+            *target = Json::from(next);
+        }
+    }
+    Ok(())
+}
+
+/// Applies patch operations to a stored document and returns its canonical text.
+/// The root must stay an object or an array.
+pub fn apply_patch(doc_text: &str, ops: &[PatchOp]) -> Result<String, DatalogError> {
+    let mut doc: Json = serde_json::from_str(doc_text).map_err(|e| patch_err(e.to_string()))?;
+    for op in ops {
+        apply_op(&mut doc, op)?;
+    }
+    if !(doc.is_object() || doc.is_array()) {
+        return Err(patch_err("the document root must stay an object or an array"));
+    }
+    serde_json::to_string(&doc).map_err(|e| patch_err(e.to_string()))
+}
