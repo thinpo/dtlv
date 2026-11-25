@@ -1,6 +1,9 @@
 pub mod parser;
 mod idoc;
 mod entity;
+mod optimizer;
+
+pub use optimizer::{Access, AnalyzeStep, PlanStep};
 
 pub use entity::Entity;
 mod wal;
@@ -1749,8 +1752,10 @@ impl Conn {
         inputs: &[QueryInput],
         rules_str: &str,
     ) -> Result<QueryResult, DatalogError> {
-        let parsed = parse_query_inputs(query_str, inputs)?;
+        let mut parsed = parse_query_inputs(query_str, inputs)?;
         let seed = seed_envs(&parsed.in_bindings, inputs)?;
+        let bound: HashSet<String> = parsed.in_vars.iter().cloned().collect();
+        parsed.clauses = self.plan_clauses(rtxn, &bound, std::mem::take(&mut parsed.clauses))?;
         let rules = parse_rules(rules_str)?;
         let mut rule_map: HashMap<String, Vec<RuleDef>> = HashMap::new();
         for r in rules {

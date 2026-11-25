@@ -20,7 +20,7 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Query | `:in` scalar, collection, tuple, relation bindings (`QueryInput`, `q_str_inputs`, `execute_inputs`) | done |
 | Query | `or-join` / `not-join` join-variable scoping | done |
 | Query | `or`, `not`, recursive rules, pull, `fulltext` clause | done (rules are naive fixpoint) |
-| Query | cost-based optimizer, `explain`, `analyze`, magic-set rules | todo |
+| Query | cost-based ordering of datom clauses (greedy, index-aware), `explain` (access path and estimate per clause), `analyze` (rows and time per clause); no join algorithms or statistics beyond AVE counts | partial |
 | Query | `like` / `not-like` with Datalevin's `!` default escape and `{:escape "c"}` option | done |
 | Query | nested queries, UDFs | todo |
 | Entity API | `rseek_datoms`, `search_datoms`, `fulltext_datoms`, `cardinality`, `max_eid` | done |
