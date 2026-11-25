@@ -61,6 +61,8 @@ pub struct AttrSpec {
     /// `:db/noindex`: values are kept on the entity (pull and entity reads work) but are not in AVE, so
     /// queries that constrain the value are rejected.
     pub noindex: bool,
+    /// Index changes are applied by `Conn::process_idoc_jobs` rather than in the writing transaction.
+    pub idoc_async: bool,
 }
 
 impl AttrSpec {
@@ -78,6 +80,7 @@ impl AttrSpec {
             excluded_paths: Vec::new(),
             idoc_domain: None,
             noindex: false,
+            idoc_async: false,
         }
     }
 
@@ -90,6 +93,13 @@ impl AttrSpec {
     /// Restricts idoc indexing to paths under these selectors (`:db.idoc/indexedPaths`).
     pub fn idoc_indexed_paths(mut self, paths: Vec<Vec<PathSeg>>) -> Self {
         self.indexed_paths = Some(paths);
+        self
+    }
+
+    /// Idoc attribute whose index is maintained by background jobs (`process_idoc_jobs`). Source writes commit
+    /// immediately; `idoc_match` sees a document once its job has run.
+    pub fn idoc_async(mut self) -> Self {
+        self.idoc_async = true;
         self
     }
 
@@ -384,6 +394,7 @@ pub struct Conn {
     tuple_targets: HashSet<AttrId>,
     tx_fns: HashMap<String, TxFn>,
     idoc_idx: RawDb,
+    idoc_jobs: RawDb,
     wal: std::sync::Mutex<Option<wal::Wal>>,
     listeners: Vec<(String, Box<dyn Fn(&TxReport)>)>,
     query_fns: HashMap<String, QueryFn>,
@@ -421,6 +432,7 @@ impl Conn {
         let vae = store.open_db(&mut wtxn, "vae")?;
         let meta = store.open_db(&mut wtxn, "meta")?;
         let idoc_idx = store.open_db(&mut wtxn, "idoc_paths")?;
+        let idoc_jobs = store.open_db(&mut wtxn, "idoc_jobs")?;
         let fts = FullTextIndex::open(&store, &mut wtxn)?;
         let vec_idx = VectorIndex::open(&store, &mut wtxn, "vec_idx", Metric::Cosine)?;
 
@@ -510,6 +522,7 @@ impl Conn {
             tuple_targets,
             tx_fns: HashMap::new(),
             idoc_idx,
+            idoc_jobs,
             wal: std::sync::Mutex::new(None),
             listeners: Vec::new(),
             query_fns: HashMap::new(),

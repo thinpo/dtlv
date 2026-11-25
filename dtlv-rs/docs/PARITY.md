@@ -58,7 +58,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Idoc | `:db/noindex` (values kept on the entity; value-constrained queries rejected; unique attributes stay indexed) | done |
 | Idoc | Markdown input (`idoc_value_markdown`): headers nest, sections store text, original's errors reproduced; inline markdown is read as plain text (the original uses a Markdown library) | done |
 | Idoc | mixed named and free array positions in one path (each array level is indexed both ways; leaves under more than six array levels keep only the two extremes) | done |
-| Idoc | async indexing with durable jobs, array values in patterns | todo |
+| Idoc | async indexing: `idoc_async` attributes record index jobs in the writing transaction; `process_idoc_jobs` applies them in order; jobs survive restart; `idoc_jobs_pending`. Processing is explicit (no background worker thread) | done |
+| Idoc | array values in patterns | todo |
 | Codecs | nippy, bits, zstd dictionary compression, CSV, Hu-Tucker keys, roaring | todo (in `datalevin/src/rust`) |
 
 ## Behavioral notes

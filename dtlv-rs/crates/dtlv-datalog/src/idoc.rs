@@ -17,6 +17,10 @@ use serde_json::Value as Json;
 use crate::parser::{parse_edn, Edn};
 use crate::{Conn, DatalogError};
 
+const JOB_PUT: u8 = 0;
+const JOB_DEL: u8 = 1;
+const IDOC_JOB_SEQ_KEY: &[u8] = b"__idoc_job_seq";
+
 /// One step of a document path. `Index` addresses one array element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathSeg {
@@ -251,7 +255,91 @@ impl Conn {
         Ok(keys)
     }
 
+    /// Index changes for `aid`'s documents. Synchronous attributes are indexed in this transaction; async ones
+    /// record a job that `process_idoc_jobs` applies later. Either way the change commits with the source write.
     pub(crate) fn idoc_put(
+        &self,
+        wtxn: &mut WriteTxn<'_>,
+        aid: AttrId,
+        eid: EntityId,
+        doc_text: &str,
+    ) -> Result<(), DatalogError> {
+        if self.is_async_idoc(aid) {
+            return self.enqueue_idoc_job(wtxn, aid, eid, JOB_PUT, doc_text);
+        }
+        self.idoc_put_now(wtxn, aid, eid, doc_text)
+    }
+
+    pub(crate) fn idoc_del(
+        &self,
+        wtxn: &mut WriteTxn<'_>,
+        aid: AttrId,
+        eid: EntityId,
+        doc_text: &str,
+    ) -> Result<(), DatalogError> {
+        if self.is_async_idoc(aid) {
+            return self.enqueue_idoc_job(wtxn, aid, eid, JOB_DEL, doc_text);
+        }
+        self.idoc_del_now(wtxn, aid, eid, doc_text)
+    }
+
+    fn is_async_idoc(&self, aid: AttrId) -> bool {
+        self.attrs.get(&aid).is_some_and(|s| s.idoc && s.idoc_async)
+    }
+
+    fn enqueue_idoc_job(
+        &self,
+        wtxn: &mut WriteTxn<'_>,
+        aid: AttrId,
+        eid: EntityId,
+        op: u8,
+        doc_text: &str,
+    ) -> Result<(), DatalogError> {
+        let seq = match self.meta.get_rw(wtxn, IDOC_JOB_SEQ_KEY)? {
+            Some(b) if b.len() == 8 => u64::from_be_bytes(b.as_ref().try_into().unwrap()),
+            _ => 0,
+        };
+        let mut val = aid.to_be_bytes().to_vec();
+        val.extend_from_slice(&eid.to_be_bytes());
+        val.push(op);
+        val.extend_from_slice(doc_text.as_bytes());
+        self.idoc_jobs.put(wtxn, &seq.to_be_bytes(), &val)?;
+        self.meta.put(wtxn, IDOC_JOB_SEQ_KEY, &(seq + 1).to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Number of index jobs waiting for `process_idoc_jobs`.
+    pub fn idoc_jobs_pending(&self) -> Result<u64, DatalogError> {
+        let rtxn = self.store.read_txn()?;
+        let mut n = 0;
+        for item in self.idoc_jobs.iter(&rtxn)? {
+            item?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Applies pending index jobs in the order they were written, in one transaction. Returns how many ran.
+    pub fn process_idoc_jobs(&self) -> Result<usize, DatalogError> {
+        let mut wtxn = self.store.write_txn()?;
+        let jobs = self.idoc_jobs.iter_rw(&wtxn)?;
+        let n = jobs.len();
+        for (seq, val) in jobs {
+            let aid = u32::from_be_bytes(val[0..4].try_into().unwrap());
+            let eid = u64::from_be_bytes(val[4..12].try_into().unwrap());
+            let op = val[12];
+            let text = std::str::from_utf8(&val[13..]).map_err(|e| DatalogError::Type(e.to_string()))?;
+            match op {
+                JOB_PUT => self.idoc_put_now(&mut wtxn, aid, eid, text)?,
+                _ => self.idoc_del_now(&mut wtxn, aid, eid, text)?,
+            }
+            self.idoc_jobs.delete(&mut wtxn, &seq)?;
+        }
+        wtxn.commit()?;
+        Ok(n)
+    }
+
+    pub(crate) fn idoc_put_now(
         &self,
         wtxn: &mut WriteTxn<'_>,
         aid: AttrId,
@@ -264,7 +352,7 @@ impl Conn {
         Ok(())
     }
 
-    pub(crate) fn idoc_del(
+    pub(crate) fn idoc_del_now(
         &self,
         wtxn: &mut WriteTxn<'_>,
         aid: AttrId,
