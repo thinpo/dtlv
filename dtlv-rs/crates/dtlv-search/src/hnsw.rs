@@ -12,7 +12,7 @@ use crate::{compute_distance, Metric};
 
 const M: usize = 16;
 const M_MAX0: usize = 2 * M;
-const EF_CONSTRUCTION: usize = 200;
+const EF_CONSTRUCTION: usize = 100;
 
 /// Total-order wrapper so distances can live in heaps.
 #[derive(Clone, Copy, PartialEq)]
