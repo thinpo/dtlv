@@ -2,6 +2,7 @@ pub mod parser;
 mod idoc;
 mod entity;
 mod optimizer;
+mod magic;
 
 pub use optimizer::{Access, AnalyzeStep, PlanStep};
 
@@ -1835,14 +1836,62 @@ impl Conn {
         for r in rules {
             rule_map.entry(r.name.clone()).or_default().push(r);
         }
-        let rule_tables = if rule_map.is_empty() {
+        let (eval_rules, clauses) = self.demand_rules(&rule_map, std::mem::take(&mut parsed.clauses));
+        parsed.clauses = clauses;
+        let rule_tables = if eval_rules.is_empty() {
             HashMap::new()
         } else {
-            self.eval_all_rules(rtxn, &rule_map)?
+            self.eval_all_rules(rtxn, &eval_rules)?
         };
 
         let envs = self.eval_clauses(rtxn, &parsed.clauses, seed, &rule_tables)?;
         self.finalize_query_result(rtxn, &parsed, envs)
+    }
+
+    /// Magic-set rewriting of the query's rule calls. Each call with a constant argument is replaced by a call to
+    /// its rewritten, demand-driven rules. Returns the rules to evaluate (rewritten rules plus the original rules
+    /// the remaining calls reach) and the rewritten clauses.
+    fn demand_rules(
+        &self,
+        rule_map: &HashMap<String, Vec<RuleDef>>,
+        clauses: Vec<Clause>,
+    ) -> (HashMap<String, Vec<RuleDef>>, Vec<Clause>) {
+        if rule_map.is_empty() {
+            return (HashMap::new(), clauses);
+        }
+        let mut rewritten_rules: HashMap<String, Vec<RuleDef>> = HashMap::new();
+        let mut clauses = clauses;
+        let mut remaining: HashSet<String> = HashSet::new();
+        for clause in clauses.iter_mut() {
+            if let Clause::RuleCall(p, args) = clause {
+                match magic::rewrite(rule_map, p, args) {
+                    Some(rw) => {
+                        for (name, defs) in rw.rules {
+                            rewritten_rules.entry(name).or_default().extend(defs);
+                        }
+                        *p = rw.goal;
+                    }
+                    None => {
+                        remaining.insert(p.clone());
+                    }
+                }
+            } else {
+                magic::called_rules(std::slice::from_ref(&*clause), &mut remaining);
+            }
+        }
+        // Original rules are needed only when a call was not rewritten, or when a rewritten rule still calls one
+        // (rewriting declined for it). Rewritten bodies name adorned rules, so they add no originals of their own.
+        let mut needed = magic::reachable(rule_map, remaining);
+        let mut eval: HashMap<String, Vec<RuleDef>> = HashMap::new();
+        for name in needed.drain() {
+            if let Some(defs) = rule_map.get(&name) {
+                eval.insert(name, defs.clone());
+            }
+        }
+        for (name, defs) in rewritten_rules {
+            eval.insert(name, defs);
+        }
+        (eval, clauses)
     }
 
     /// Runs a nested query on its own bindings and returns its rows.

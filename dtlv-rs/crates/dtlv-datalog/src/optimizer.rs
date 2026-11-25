@@ -79,7 +79,7 @@ fn term_vars(t: &ExprTerm, out: &mut HashSet<String>) {
 }
 
 /// Every variable a clause mentions. Used to track what is bound after it.
-fn clause_vars(c: &Clause, out: &mut HashSet<String>) {
+pub(crate) fn clause_vars(c: &Clause, out: &mut HashSet<String>) {
     match c {
         Clause::Datom(e, _, v) => {
             term_vars(e, out);
