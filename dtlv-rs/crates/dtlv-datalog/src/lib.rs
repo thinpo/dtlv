@@ -12,7 +12,7 @@ pub use idoc::{apply_patch, idoc_get, idoc_value, idoc_value_edn, pattern_predic
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use dtlv_codec::{
-    decode_ave_entity, decode_value, encode_av_prefix, encode_ave_key, encode_ea_prefix,
+    decode_ave_entity, decode_value, encode_av_prefix, encode_ave_key, encode_ea_prefix, encode_value,
     encode_eav_key, encode_vae_key, AttrId, CodecError, EntityId, Value,
 };
 use dtlv_kv::{KvError, KvStore, RawDb, ReadTxn, WriteTxn};
@@ -1499,7 +1499,9 @@ impl Conn {
 
         if let Some(u) = spec.unique {
             if let Some(existing) = self.lookup_ave_rw(wtxn, aid, val, ave_buf)? {
-                if existing != eid && u == Unique::Value {
+                // An identity value resolves to its entity before this point, so a different entity here
+                // means an explicit id conflicts with the unique value: reject it for both kinds.
+                if existing != eid {
                     return Err(DatalogError::UniqueViolation {
                         attr: attr_name.to_owned(),
                         existing,
@@ -1780,7 +1782,70 @@ impl Conn {
             .any(|e| matches!(e, FindElem::Agg(_, _)));
 
         if has_agg {
-            let rows = aggregate_envs(&envs, &parsed.find)?;
+            // Set semantics: aggregate over the distinct bindings of the find and :with variables, so
+            // duplicate derivations (e.g. through `or`) do not inflate counts.
+            let proj: Vec<&str> = parsed
+                .find
+                .iter()
+                .map(|e| match e {
+                    FindElem::Var(v) | FindElem::Pull(v, _) | FindElem::Agg(_, v) => v.as_str(),
+                })
+                .chain(parsed.with_vars.iter().map(|v| v.as_str()))
+                .collect();
+            let mut seen: HashSet<Vec<Option<Vec<u8>>>> = HashSet::new();
+            let distinct: Vec<HashMap<String, Value>> = envs
+                .into_iter()
+                .filter(|env| {
+                    let key = proj
+                        .iter()
+                        .map(|v| {
+                            env.get(*v).map(|val| {
+                                let mut buf = Vec::new();
+                                encode_value(val, &mut buf);
+                                buf
+                            })
+                        })
+                        .collect();
+                    seen.insert(key)
+                })
+                .collect();
+
+            let mut rows = aggregate_envs(&distinct, &parsed.find)?;
+
+            // :order-by names a find variable or a column index; the aggregated rows are sorted by it.
+            if !parsed.order_by.is_empty() {
+                let keys: Vec<(usize, bool)> = parsed
+                    .order_by
+                    .iter()
+                    .filter_map(|spec| {
+                        let col = match &spec.key {
+                            OrderKey::Col(i) => Some(*i),
+                            OrderKey::Var(v) => parsed
+                                .find
+                                .iter()
+                                .position(|e| matches!(e, FindElem::Var(x) | FindElem::Pull(x, _) if x == v)),
+                        };
+                        col.filter(|c| *c < parsed.find.len()).map(|c| (c, spec.desc))
+                    })
+                    .collect();
+                rows.sort_by(|a, b| {
+                    for &(c, desc) in &keys {
+                        if let (Some(va), Some(vb)) = (a.get(c), b.get(c)) {
+                            if let Some(ord) = cmp_vals(va, vb) {
+                                if ord != std::cmp::Ordering::Equal {
+                                    return if desc { ord.reverse() } else { ord };
+                                }
+                            }
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            let start = parsed.offset.unwrap_or(0).max(0) as usize;
+            let rows: Vec<Vec<Value>> = match parsed.limit {
+                Some(lim) if lim >= 0 => rows.into_iter().skip(start).take(lim as usize).collect(),
+                _ => rows.into_iter().skip(start).collect(),
+            };
             return Ok(match parsed.find_spec {
                 FindSpec::Rel => QueryResult::Rel(rows),
                 FindSpec::Scalar => QueryResult::Scalar(rows.into_iter().next().and_then(|r| r.into_iter().next())),
@@ -2068,7 +2133,8 @@ impl Conn {
                                 None => continue,
                             },
                         };
-                        let hits = self.fts.search_query(rtxn, &query, 100)?;
+                        // No cap: a Datalog clause must return every match, not just the top results.
+                        let hits = self.fts.search_query(rtxn, &query, usize::MAX)?;
                         for &(eid, _) in &hits {
                             let mut e2 = env.clone();
                             if bind_var(&mut e2, e_var, Value::Ref(eid)) {

@@ -316,6 +316,8 @@ pub struct ParsedQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub return_keys: Option<Vec<String>>,
+    /// `:with` variables: kept in the set of rows aggregated, but not returned.
+    pub with_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -835,6 +837,7 @@ fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<Parsed
     let mut limit = None;
     let mut offset = None;
     let mut return_keys = None;
+    let mut with_vars: Vec<String> = Vec::new();
 
     match edn {
         Edn::Vec(items) => {
@@ -845,10 +848,11 @@ fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<Parsed
                 if let Edn::Keyword(kw) = &items[i] {
                     if matches!(
                         kw.as_str(),
-                        ":find" | ":in" | ":where" | ":order-by" | ":limit" | ":offset" | ":keys" | ":strs" | ":syms"
+                        ":find" | ":in" | ":where" | ":order-by" | ":limit" | ":offset" | ":keys" | ":strs" | ":syms" | ":with"
                     ) {
                         section = match kw.as_str() {
                             ":find" => "find",
+                            ":with" => "with",
                             ":in" => "in",
                             ":where" => "where",
                             ":order-by" => "order-by",
@@ -869,6 +873,11 @@ fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<Parsed
                         }
                     }
                     "where" => where_edns.push(items[i].clone()),
+                    "with" => {
+                        if let Edn::Symbol(s) = &items[i] {
+                            with_vars.push(s.clone());
+                        }
+                    }
                     "order-by" => order_by = parse_order_by(&items[i])?,
                     "limit" => {
                         if let Edn::Int(n) = items[i] {
@@ -918,6 +927,15 @@ fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<Parsed
                         }
                     }
                     ":order-by" => order_by = parse_order_by(&v)?,
+                    ":with" => {
+                        if let Edn::Vec(items) = v {
+                            for item in items {
+                                if let Edn::Symbol(s) = item {
+                                    with_vars.push(s);
+                                }
+                            }
+                        }
+                    }
                     ":limit" => {
                         if let Edn::Int(n) = v {
                             limit = Some(n);
@@ -994,6 +1012,7 @@ fn parse_query_impl(input: &str, inputs: Option<&[QueryInput]>) -> Result<Parsed
         limit,
         offset,
         return_keys,
+        with_vars,
     })
 }
 
