@@ -2,7 +2,7 @@ pub mod fulltext;
 pub mod hnsw;
 pub mod stem;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use hnsw::Hnsw;
@@ -40,6 +40,8 @@ pub struct VectorStats {
     pub incremental_updates: u64,
     /// Graphs loaded from the copy saved by `save_graph`, instead of rebuilt.
     pub loads: u64,
+    /// Graphs written to `meta` by `save_graph`.
+    pub saves: u64,
 }
 
 /// LMDB-persisted vector index for entity embeddings (entity resolution & semantic lookup).
@@ -57,6 +59,9 @@ pub struct VectorIndex {
     rebuilds: AtomicU64,
     incremental: AtomicU64,
     loads: AtomicU64,
+    saves: AtomicU64,
+    /// Set after a rebuild; the next write saves the graph so a restart can load it.
+    dirty: AtomicBool,
 }
 
 impl VectorIndex {
@@ -73,6 +78,8 @@ impl VectorIndex {
             rebuilds: AtomicU64::new(0),
             incremental: AtomicU64::new(0),
             loads: AtomicU64::new(0),
+            saves: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -81,6 +88,7 @@ impl VectorIndex {
             rebuilds: self.rebuilds.load(Ordering::Relaxed),
             incremental_updates: self.incremental.load(Ordering::Relaxed),
             loads: self.loads.load(Ordering::Relaxed),
+            saves: self.saves.load(Ordering::Relaxed),
         }
     }
 
@@ -93,7 +101,18 @@ impl VectorIndex {
         };
         self.meta.put(wtxn, GRAPH_KEY, &graph.to_bytes())?;
         self.meta.put(wtxn, GRAPH_VERSION_KEY, &version.to_be_bytes())?;
+        self.saves.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Saves the graph after a rebuild, on the first write that follows it.
+    fn save_if_dirty(&self, wtxn: &mut WriteTxn<'_>) -> Result<(), KvError> {
+        if self.dirty.load(Ordering::Relaxed) {
+            self.save_graph(wtxn)?;
+            // shortcut: dirty is cleared before commit; if this write txn aborts, the save is lost until the next rebuild.
+            self.dirty.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Loads the graph saved by `save_graph` if it is intact, uses this index's metric, and is not newer than
@@ -139,7 +158,8 @@ impl VectorIndex {
         let mut op = vec![OP_UPSERT];
         op.extend_from_slice(&eid.to_be_bytes());
         op.extend_from_slice(&bytes);
-        self.record(wtxn, &op)
+        self.record(wtxn, &op)?;
+        self.save_if_dirty(wtxn)
     }
 
     /// Removes the vector of `eid`. Removing an absent entity changes nothing and does not advance the version.
@@ -149,7 +169,8 @@ impl VectorIndex {
         }
         let mut op = vec![OP_REMOVE];
         op.extend_from_slice(&eid.to_be_bytes());
-        self.record(wtxn, &op)
+        self.record(wtxn, &op)?;
+        self.save_if_dirty(wtxn)
     }
 
     pub fn dump_vecs(&self, rtxn: &ReadTxn<'_>) -> Result<Vec<(EntityId, Vec<f32>)>, KvError> {
@@ -221,6 +242,7 @@ impl VectorIndex {
             let items = self.dump_vecs(rtxn)?;
             *guard = Some((version, Hnsw::build(self.metric, items)));
             self.rebuilds.fetch_add(1, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
         }
         let graph = &guard.as_ref().expect("graph is current").1;
         Ok(graph.search(query, k, EF_SEARCH).into_iter().collect())

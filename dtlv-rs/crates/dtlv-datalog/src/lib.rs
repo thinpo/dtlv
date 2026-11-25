@@ -838,8 +838,9 @@ impl Conn {
         Ok(())
     }
 
-    /// Saves the cached vector graph so the next process's first large search skips the rebuild. Call it before
-    /// closing. A saved graph is ignored once it is older than the vector log retains.
+    /// Saves the cached vector graph so the next process's first large search skips the rebuild. The graph is also
+    /// saved automatically on the first vector write after a rebuild, so calling this is only needed when no vector
+    /// write follows a rebuild. A saved graph is ignored once it is older than the vector log retains.
     pub fn save_vector_graph(&self) -> Result<bool, DatalogError> {
         let mut wtxn = self.store.write_txn()?;
         let saved = self.vec_idx.save_graph(&mut wtxn)?;

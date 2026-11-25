@@ -117,3 +117,51 @@ fn corrupt_saved_graph_falls_back_to_rebuild() {
     assert_eq!(idx.stats().rebuilds, 1);
     assert_eq!(after, before);
 }
+
+#[test]
+fn first_write_after_rebuild_saves_graph_automatically() {
+    let dir = tempdir().unwrap();
+    let query = Lcg(9).vec(8);
+    let mut rng = Lcg(10);
+    let added: Vec<(u64, Vec<f32>)> = (0..2u64).map(|i| (20_000 + i, rng.vec(8))).collect();
+    {
+        let (store, idx) = open(dir.path());
+        add_all(&store, &idx, &initial_items(5));
+        search(&store, &idx, &query, 10);
+        assert_eq!(idx.stats().rebuilds, 1);
+        assert_eq!(idx.stats().saves, 0);
+        add_all(&store, &idx, &added[..1]);
+        assert_eq!(idx.stats().saves, 1);
+        add_all(&store, &idx, &added[1..]);
+        assert_eq!(idx.stats().saves, 1);
+    }
+    let (store, idx) = open(dir.path());
+    search(&store, &idx, &query, 10);
+    assert_eq!(idx.stats().loads, 1);
+    assert_eq!(idx.stats().rebuilds, 0);
+    for (eid, v) in &added {
+        assert_eq!(search(&store, &idx, v, 1)[0].0, *eid);
+    }
+}
+
+#[test]
+fn remove_of_absent_entity_after_rebuild_does_not_save() {
+    let dir = tempdir().unwrap();
+    let (store, idx) = open(dir.path());
+    add_all(&store, &idx, &initial_items(6));
+    search(&store, &idx, &[0.0; 8], 5);
+    assert_eq!(idx.stats().rebuilds, 1);
+    let mut w = store.write_txn().unwrap();
+    idx.remove_vec(&mut w, 99_999).unwrap();
+    w.commit().unwrap();
+    assert_eq!(idx.stats().saves, 0);
+}
+
+#[test]
+fn writes_without_a_search_never_save() {
+    let dir = tempdir().unwrap();
+    let (store, idx) = open(dir.path());
+    add_all(&store, &idx, &initial_items(7));
+    assert_eq!(idx.stats().rebuilds, 0);
+    assert_eq!(idx.stats().saves, 0);
+}
