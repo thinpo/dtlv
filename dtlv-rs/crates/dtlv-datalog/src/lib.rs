@@ -2179,6 +2179,8 @@ impl Conn {
                     if spec.noindex && !matches!(v_term, ExprTerm::Var(_) | ExprTerm::Wildcard) {
                         return Err(DatalogError::Type(format!("{attr_name} is :db/noindex; value conditions cannot use it")));
                     }
+                    // The unconstrained scan of this attribute is shared by every binding, so it runs at most once.
+                    let mut attr_rows: Option<Vec<(EntityId, Value)>> = None;
                     for env in &envs {
                         let bound_e: Option<EntityId> = match e_term {
                             ExprTerm::Val(v) => v.as_ref(),
@@ -2234,22 +2236,30 @@ impl Conn {
                                 }
                             }
                             (None, _) => {
-                                for item in self.eav.iter(rtxn)? {
-                                    let (k, _) = item?;
-                                    if k.len() < 12 {
-                                        continue;
+                                if attr_rows.is_none() {
+                                    let mut rows = Vec::new();
+                                    for item in self.eav.iter(rtxn)? {
+                                        let (k, _) = item?;
+                                        if k.len() < 12 {
+                                            continue;
+                                        }
+                                        let k_aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
+                                        if k_aid != aid {
+                                            continue;
+                                        }
+                                        let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
+                                        rows.push((eid, decode_value(&k[12..])?));
                                     }
-                                    let k_aid = u32::from_be_bytes(k[8..12].try_into().unwrap());
-                                    if k_aid != aid {
-                                        continue;
-                                    }
-                                    let eid = u64::from_be_bytes(k[0..8].try_into().unwrap());
-                                    let val = decode_value(&k[12..])?;
+                                    attr_rows = Some(rows);
+                                }
+                                for (eid, val) in attr_rows.as_deref().unwrap_or_default() {
+                                    let eid = *eid;
                                     if let Some(bv) = bound_v {
-                                        if &val != bv {
+                                        if val != bv {
                                             continue;
                                         }
                                     }
+                                    let val = val.clone();
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(ename) = e_term {
                                         if let Some(existing) = e2.get(ename) {
