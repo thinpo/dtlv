@@ -3039,14 +3039,31 @@ impl<'conn> PreparedQuery<'conn> {
 
     pub fn execute_inputs(&self, rtxn: &ReadTxn<'_>, inputs: &[QueryInput]) -> Result<QueryResult, DatalogError> {
         let seed = seed_envs(&self.parsed.in_bindings, inputs)?;
-        let rule_tables = if self.rule_map.is_empty() {
+        // shortcut: rewrites per execution; cache per adornment only if rewriting shows up in profiles.
+        let mut clauses = self.parsed.clauses.clone();
+        if seed.len() == 1 {
+            // Substitute the single input's values into top-level rule calls so magic-set rewriting can fire.
+            for c in clauses.iter_mut() {
+                if let Clause::RuleCall(_, args) = c {
+                    for a in args.iter_mut() {
+                        if let ExprTerm::Var(v) = a {
+                            if let Some(val) = seed[0].get(v) {
+                                *a = ExprTerm::Val(val.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (eval_rules, clauses) = self.conn.demand_rules(&self.rule_map, clauses);
+        let rule_tables = if eval_rules.is_empty() {
             HashMap::new()
         } else {
-            self.conn.eval_all_rules(rtxn, &self.rule_map)?
+            self.conn.eval_all_rules(rtxn, &eval_rules)?
         };
         let envs = self
             .conn
-            .eval_clauses(rtxn, &self.parsed.clauses, seed, &rule_tables)?;
+            .eval_clauses(rtxn, &clauses, seed, &rule_tables)?;
         self.conn.finalize_query_result(rtxn, &self.parsed, envs)
     }
 }

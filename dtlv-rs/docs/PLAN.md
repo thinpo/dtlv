@@ -44,6 +44,11 @@ the access path actually used.
 
 ### 1.2 Magic sets on prepared queries
 
+**Done (single-env inputs).** `execute_inputs` substitutes a single input env's values into top-level rule calls,
+then runs `demand_rules`. Collection/relation inputs (several envs) still evaluate in full. The per-adornment
+rewrite cache is not built: rewriting is cheap next to evaluation (2.7 ms prepared vs 6.7 s full closure, debug).
+Tests: `prepared_magic_test`. Original plan kept below for reference.
+
 `PreparedQuery` parses the template once. Its inputs are variables at prepare time, so `demand_rules` sees no
 constants and never rewrites them. Two parts:
 
