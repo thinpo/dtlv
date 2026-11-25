@@ -37,7 +37,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | KV | LMDB drop empties the DBI but cannot remove its name (pinned `heed`); copy on redb and memory unsupported | known limit |
 | KV | sample, buffers, stat beyond entry count, list ops exposed through `Conn` | todo |
 | Durability | Datalog write-ahead log (`Conn::open_wal`): framed and checksummed, replay of unapplied records, torn-tail recovery, `checkpoint`, strict and relaxed profiles | done |
-| Durability | KV-level WAL, segmented txlog, snapshots, GC, watermarks, env flags for no-sync writes, tx-group, async tx | todo |
+| Durability | KV-level log (`DurableKv`): batches logged before commit, replay of unapplied batches, torn-tail recovery, checkpoint (log truncation), snapshots. Tested on LMDB and SQLite; redb and memory share the code path but are untested | done |
+| Durability | segmented txlog, automatic checkpoints and retention, watermarks, env flags for no-sync writes, tx-group, async tx | todo |
 | Durability | a failed store commit after a log append is marked aborted, and replay skips it (replay path tested; the live failure path is not) | done |
 | Search | BM25 with Datalevin's default analyzer (stopwords on, positions kept across gaps) | done |
 | Search | English Snowball (Porter2) stemming, `FtsConfig` (fixed before indexing) | done |
