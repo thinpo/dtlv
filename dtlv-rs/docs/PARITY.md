@@ -49,7 +49,8 @@ Source of truth: `datalevin/src` (Clojure) and `datalevin/src/rust` (codecs).
 | Search | fuzzy and prefix terms, custom analyzers, doc-filter, paging | todo |
 | Vector | exact top-k over 3 metrics (used below 512 vectors) | done |
 | Vector | in-memory HNSW for indexes above 512 vectors, rebuilt after writes (version-checked) | done |
-| Vector | incremental graph maintenance, persisted graph, quantization, checkpoints, `vec-neighbors` in query | todo |
+| Vector | incremental graph maintenance (log replay, tombstones, rebuild fallback) | done |
+| Vector | persisted graph, quantization, checkpoints, `vec-neighbors` in query | todo |
 | Idoc | JSON documents, path index (concrete, collapsed, wildcard forms), `idoc_match` (conjunctive), `idoc_get` | done (JSON, sync indexing) |
 | Idoc | `idoc-match` clause in Datalog queries (`[(idoc-match $ :attr {...}) [[?e ?a ?v]]]`, literal or bound pattern values) | done |
 | Idoc | `:db.fn/patchIdoc` (set, unset, conj, merge, assoc, dissoc, inc, dec) on cardinality-one attributes, atomic with the transaction and logged to the WAL | done |
