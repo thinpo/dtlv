@@ -107,3 +107,47 @@ fn invalid_patches_are_rejected() {
     let other = conn.transact(&[TxItem::Assert(None, vec![])]).unwrap()[0];
     assert!(matches!(patch(&conn, other, vec![PatchOp::Assoc(vec![], "a".into(), json!(1))]), Err(DatalogError::Type(_))));
 }
+
+#[test]
+fn cardinality_many_patch_targets_the_document_given_as_old() {
+    let conn = Conn::open_mem(vec![AttrSpec::new(":doc/many").idoc().many()]).unwrap();
+    let a = idoc_value(r#"{"id":1,"status":"a"}"#).unwrap();
+    let b = idoc_value(r#"{"id":2,"status":"b"}"#).unwrap();
+    let e = conn
+        .transact(&[TxItem::Assert(None, vec![(":doc/many".into(), a.clone()), (":doc/many".into(), b.clone())])])
+        .unwrap()[0];
+    conn.transact(&[TxItem::PatchIdocOf(e, ":doc/many".into(), a, vec![PatchOp::Set(vec![key("status")], json!("done"))])])
+        .unwrap();
+
+    let rtxn = conn.read_txn().unwrap();
+    let docs: Vec<String> = conn
+        .get_attr_many(&rtxn, e, ":doc/many")
+        .unwrap()
+        .into_iter()
+        .map(|v| match v {
+            Value::Doc(t) => t,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    drop(rtxn);
+    assert_eq!(docs.len(), 2);
+    assert!(docs.contains(&r#"{"id":1,"status":"done"}"#.to_string()));
+    assert!(docs.contains(&r#"{"id":2,"status":"b"}"#.to_string()));
+    let count = |status: &str| {
+        let rtxn = conn.read_txn().unwrap();
+        conn.idoc_match(&rtxn, Some(":doc/many"), &pattern_predicates(&json!({"status": status})).unwrap())
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count("done"), 1);
+    assert_eq!(count("a"), 0);
+}
+
+#[test]
+fn cardinality_many_patch_with_a_missing_document_is_rejected() {
+    let conn = Conn::open_mem(vec![AttrSpec::new(":doc/many").idoc().many()]).unwrap();
+    let e = conn.transact(&[TxItem::Assert(None, vec![(":doc/many".into(), idoc_value(r#"{"x":1}"#).unwrap())])]).unwrap()[0];
+    let stale = idoc_value(r#"{"x":2}"#).unwrap();
+    let err = conn.transact(&[TxItem::PatchIdocOf(e, ":doc/many".into(), stale, vec![PatchOp::Set(vec![key("x")], json!(3))])]);
+    assert!(matches!(err, Err(DatalogError::Type(_))));
+}

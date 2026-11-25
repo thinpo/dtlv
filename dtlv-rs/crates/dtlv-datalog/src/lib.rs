@@ -206,6 +206,8 @@ pub enum TxItem {
     Call(String, Vec<Value>),
     /// `:db.fn/patchIdoc`: applies operations to the current document of a cardinality-one idoc attribute.
     PatchIdoc(EntityId, String, Vec<PatchOp>),
+    /// `:db.fn/patchIdoc` on a cardinality-many attribute: `old` identifies which stored document to patch.
+    PatchIdocOf(EntityId, String, Value, Vec<PatchOp>),
 }
 
 /// Read view handed to a transaction function. Sees the in-progress transaction.
@@ -1335,6 +1337,32 @@ impl Conn {
                 };
                 let patched = Value::Doc(apply_patch(&current, ops)?);
                 // Cardinality one: assert_datom retracts the old document and indexes the new one.
+                self.assert_datom(wtxn, *eid, attr_name, &patched, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
+                st.touched.push(*eid);
+            }
+            TxItem::PatchIdocOf(eid, attr_name, old, ops) => {
+                self.reject_tuple_writes([attr_name.as_str()])?;
+                let aid = self.attr_id(attr_name)?;
+                if !self.attrs.get(&aid).is_some_and(|s| s.idoc) {
+                    return Err(DatalogError::Type(format!("{attr_name} is not an idoc attribute")));
+                }
+                let Value::Doc(old_text) = old else {
+                    return Err(DatalogError::Type("patchIdoc old value must be a document".into()));
+                };
+                let mut key = Vec::new();
+                encode_eav_key(*eid, aid, old, &mut key);
+                if self.eav.get_rw(&*wtxn, &key)?.is_none() {
+                    return Err(DatalogError::Type(format!("entity {eid} has no matching {attr_name} document")));
+                }
+                let patched = Value::Doc(apply_patch(old_text, ops)?);
+                // Retract the old document (and its index entries), then assert the patched one.
+                self.eav.delete(wtxn, &key)?;
+                if self.attrs[&aid].index {
+                    encode_ave_key(aid, old, *eid, &mut st.ave_buf);
+                    self.ave.delete(wtxn, &st.ave_buf)?;
+                }
+                self.idoc_del(wtxn, aid, *eid, old_text)?;
+                st.changes.push(TxDatum { eid: *eid, attr: attr_name.clone(), value: old.clone(), added: false });
                 self.assert_datom(wtxn, *eid, attr_name, &patched, &mut st.eav_buf, &mut st.ave_buf, &mut st.changes)?;
                 st.touched.push(*eid);
             }

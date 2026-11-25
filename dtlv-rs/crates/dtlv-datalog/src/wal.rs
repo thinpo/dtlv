@@ -144,6 +144,16 @@ fn encode_item(out: &mut Vec<u8>, item: &TxItem) {
                 encode_patch_op(out, op);
             }
         }
+        TxItem::PatchIdocOf(e, a, old, ops) => {
+            out.push(7);
+            out.extend_from_slice(&e.to_be_bytes());
+            put_bytes(out, a.as_bytes());
+            put_value(out, old);
+            out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+            for op in ops {
+                encode_patch_op(out, op);
+            }
+        }
         // Calls are expanded before logging; a logged `Call` would have no replayable meaning.
         TxItem::Call(..) => unreachable!("transaction calls are logged as the items they produced"),
     }
@@ -333,6 +343,17 @@ impl<'a> Reader<'a> {
             3 => TxItem::RetractAttribute(self.u64()?, self.string()?),
             4 => TxItem::RetractEntity(self.u64()?),
             5 => TxItem::Cas(self.u64()?, self.string()?, self.value()?, self.value()?),
+            7 => {
+                let e = self.u64()?;
+                let a = self.string()?;
+                let old = self.value()?;
+                let n = self.u32()?;
+                let mut ops = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    ops.push(self.patch_op()?);
+                }
+                TxItem::PatchIdocOf(e, a, old, ops)
+            }
             6 => {
                 let e = self.u64()?;
                 let a = self.string()?;
@@ -654,6 +675,12 @@ mod tests {
                     PatchOp::Inc(vec![PathSeg::Index(0)], -4),
                     PatchOp::Dec(vec![PathSeg::Index(0)], 9),
                 ],
+            ),
+            TxItem::PatchIdocOf(
+                12,
+                ":w/doc".into(),
+                Value::Doc(r#"{"a":1}"#.into()),
+                vec![PatchOp::Assoc(vec![], "b".into(), serde_json::json!(2))],
             ),
         ];
         let (mut log, _) = Wal::open(&log_path, Durability::Relaxed, 0).unwrap();
