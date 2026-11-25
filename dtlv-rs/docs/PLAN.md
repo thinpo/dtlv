@@ -21,7 +21,11 @@ Open shapes:
   clause's rows keyed by the values of the variables the clause shares with the bindings (for a datom: `e`, `v`, or
   both), then probe it once per binding. Equality uses the canonical key from `probe_key` (zero and NaN as already
   handled). Shapes with no shared variable stay a cross product, which is the correct semantics.
-- **Indexed lookup per binding.** Example: `[?a :p/grp ?g] [?b :p/grp ?g]` with `:p/grp` indexed. Each binding does its
+- **Indexed lookup per binding: partly done.** Index scans are now memoized per clause by their bound key (entity or
+  encoded value), so bindings that share a key share one scan. `indexed_lookup_test` checks correctness and a cost
+  bound; the memo's own saving is not isolated by those tests (result building dominates at that size).
+  Remaining: the general case in the original description below.
+- **Indexed lookup per binding (original description).** Example: `[?a :p/grp ?g] [?b :p/grp ?g]` with `:p/grp` indexed. Each binding does its
   own AVE prefix scan, so n bindings cost n index scans, with repeated `?g` values scanned repeatedly. Plan: group
   bindings by their bound key, run one AVE scan per distinct key, and fan the results back out. Bounded by the number
   of distinct keys, not bindings.

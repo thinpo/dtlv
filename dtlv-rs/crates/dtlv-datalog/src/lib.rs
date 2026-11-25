@@ -2235,6 +2235,9 @@ impl Conn {
                     let spec = &self.attrs[&aid];
                     // The unconstrained scan of this attribute is shared by every binding, so it runs at most once.
                     let mut attr_rows: Option<Vec<(EntityId, Value)>> = None;
+                    // Index scans are memoized per clause by their bound key: bindings that share a key share a scan.
+                    let mut ea_memo: HashMap<EntityId, Vec<Value>> = HashMap::new();
+                    let mut ave_memo: HashMap<Vec<u8>, Vec<EntityId>> = HashMap::new();
                     let mut attr_hash: Option<HashMap<Vec<u8>, Vec<EntityId>>> = None;
                     for env in &envs {
                         let bound_e: Option<EntityId> = match e_term {
@@ -2255,10 +2258,17 @@ impl Conn {
                                 }
                             }
                             (Some(eid), None) => {
-                                encode_ea_prefix(eid, aid, &mut buf);
-                                for item in self.eav.prefix_iter(rtxn, &buf)? {
-                                    let (k, _) = item?;
-                                    let val = decode_value(&k[12..])?;
+                                if !ea_memo.contains_key(&eid) {
+                                    encode_ea_prefix(eid, aid, &mut buf);
+                                    let mut vals = Vec::new();
+                                    for item in self.eav.prefix_iter(rtxn, &buf)? {
+                                        let (k, _) = item?;
+                                        vals.push(decode_value(&k[12..])?);
+                                    }
+                                    ea_memo.insert(eid, vals);
+                                }
+                                for val in &ea_memo[&eid] {
+                                    let val = val.clone();
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(vname) = v_term {
                                         if let Some(existing) = e2.get(vname) {
@@ -2274,9 +2284,15 @@ impl Conn {
                             }
                             (None, Some(val)) if spec.index => {
                                 encode_av_prefix(aid, val, &mut buf);
-                                for item in self.ave.prefix_iter(rtxn, &buf)? {
-                                    let (k, _) = item?;
-                                    let eid = decode_ave_entity(&k)?;
+                                if !ave_memo.contains_key(buf.as_slice()) {
+                                    let mut eids = Vec::new();
+                                    for item in self.ave.prefix_iter(rtxn, &buf)? {
+                                        let (k, _) = item?;
+                                        eids.push(decode_ave_entity(&k)?);
+                                    }
+                                    ave_memo.insert(buf.clone(), eids);
+                                }
+                                for &eid in &ave_memo[buf.as_slice()] {
                                     let mut e2 = env.clone();
                                     if let ExprTerm::Var(ename) = e_term {
                                         if let Some(existing) = e2.get(ename) {
