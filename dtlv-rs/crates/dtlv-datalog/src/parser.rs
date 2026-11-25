@@ -405,10 +405,22 @@ fn edn_to_fts(edn: &Edn) -> Result<FtsQuery, ParseError> {
         Edn::Vec(items) if !items.is_empty() => {
             let op = match &items[0] {
                 Edn::Keyword(k) => k.as_str(),
-                _ => return Err(ParseError::InvalidQuery("full-text vector must start with :and, :or, or :not".into())),
+                _ => return Err(ParseError::InvalidQuery("full-text vector must start with :and, :or, :not, :prefix, or :fuzzy".into())),
             };
-            let children = items[1..].iter().map(edn_to_fts).collect::<Result<Vec<_>, _>>()?;
+            let children = match op {
+                ":prefix" | ":fuzzy" => Vec::new(),
+                _ => items[1..].iter().map(edn_to_fts).collect::<Result<Vec<_>, _>>()?,
+            };
             match op {
+                ":prefix" => match &items[1..] {
+                    [Edn::Str(s)] => Ok(FtsQuery::Prefix(s.clone())),
+                    _ => Err(ParseError::InvalidQuery("[:prefix] takes one string".into())),
+                },
+                ":fuzzy" => match &items[1..] {
+                    [Edn::Str(s)] => Ok(FtsQuery::Fuzzy(s.clone(), 1)),
+                    [Edn::Str(s), Edn::Int(n)] if (0..=2).contains(n) => Ok(FtsQuery::Fuzzy(s.clone(), *n as u8)),
+                    _ => Err(ParseError::InvalidQuery("[:fuzzy] takes a string and an optional distance 0..=2".into())),
+                },
                 ":and" => Ok(FtsQuery::And(children)),
                 ":or" => Ok(FtsQuery::Or(children)),
                 ":not" if children.len() == 1 => Ok(FtsQuery::Not(Box::new(children.into_iter().next().unwrap()))),

@@ -41,6 +41,10 @@ pub enum Query {
     Text(String),
     Term(String),
     Phrase(String),
+    /// Every indexed term starting with the (lowercased) string.
+    Prefix(String),
+    /// Every indexed term within Levenshtein distance `d` (clamped to 2) of the (lowercased) string.
+    Fuzzy(String, u8),
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
@@ -285,6 +289,35 @@ impl FullTextIndex {
         self.bm25_term(rtxn, stats, &postings)
     }
 
+    /// Distinct indexed terms (sorted) whose bytes satisfy `pred`, scanning postings under `scan_prefix`.
+    fn matching_terms(&self, rtxn: &ReadTxn<'_>, pred: impl Fn(&str) -> bool, scan_prefix: &[u8]) -> Result<Vec<String>, KvError> {
+        let mut out = Vec::new();
+        let mut last: Option<Vec<u8>> = None;
+        for item in self.postings.prefix_iter(rtxn, scan_prefix)? {
+            let (k, _) = item?;
+            let term = &k[..k.iter().position(|&b| b == 0x00).unwrap_or(k.len())];
+            if last.as_deref() == Some(term) {
+                continue;
+            }
+            last = Some(term.to_vec());
+            if let Ok(t) = std::str::from_utf8(term) {
+                if pred(t) {
+                    out.push(t.to_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Union of the documents of several exact terms, collapsed to entities.
+    fn terms_docs(&self, rtxn: &ReadTxn<'_>, terms: &[String], stats: Stats) -> Result<HashMap<EntityId, f64>, KvError> {
+        let mut out = HashMap::new();
+        for term in terms {
+            merge_or(&mut out, Self::collapse(self.term_docs(rtxn, term, stats)?));
+        }
+        Ok(out)
+    }
+
     /// Collapses document scores to entities: an entity's score is the sum over its matching documents.
     fn collapse(docs: HashMap<Vec<u8>, f64>) -> HashMap<EntityId, f64> {
         let mut out: HashMap<EntityId, f64> = HashMap::new();
@@ -307,6 +340,24 @@ impl FullTextIndex {
             }
             Query::Term(term) => Ok(Self::collapse(self.term_docs(rtxn, term, stats)?)),
             Query::Phrase(text) => Ok(Self::collapse(self.eval_phrase(rtxn, text, stats)?)),
+            Query::Prefix(text) => {
+                let p = text.to_lowercase();
+                if p.is_empty() {
+                    return Ok(HashMap::new());
+                }
+                let terms = self.matching_terms(rtxn, |t| t.starts_with(&p), p.as_bytes())?;
+                self.terms_docs(rtxn, &terms, stats)
+            }
+            Query::Fuzzy(text, d) => {
+                let q = text.to_lowercase();
+                if q.is_empty() {
+                    return Ok(HashMap::new());
+                }
+                let d = usize::from((*d).min(2));
+                // shortcut: fuzzy scans the whole term dictionary; add a term FST/trie if this shows up in profiles.
+                let terms = self.matching_terms(rtxn, |t| levenshtein(t, &q) <= d, &[])?;
+                self.terms_docs(rtxn, &terms, stats)
+            }
             Query::Or(qs) => {
                 let mut out = HashMap::new();
                 for sub in qs {
@@ -442,9 +493,32 @@ fn merge_or(into: &mut HashMap<EntityId, f64>, from: HashMap<EntityId, f64>) {
     }
 }
 
+/// Edit distance over chars, using two rows of the DP table.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levenshtein_counts_edits() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("same", "same"), 0);
+    }
 
     #[test]
     fn analyzer_drops_stopwords_but_keeps_position_gaps() {

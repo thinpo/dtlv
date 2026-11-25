@@ -71,7 +71,10 @@ Known limits to keep: rules with `or`, `not`, or nested queries still fall back 
 - Transactions: `with` simulation and `:db/ensure`.
 - Schema: changing cardinality or uniqueness of an existing attribute in place.
 - Durability: segmented txlog, automatic checkpoints and retention, env flags for no-sync writes, group commit.
-- Search: fuzzy and prefix terms, custom analyzers, doc filters and paging.
+- Search: custom analyzers, doc filters and paging. Prefix and fuzzy terms are done (`[:prefix "s"]`,
+  `[:fuzzy "s" d]`, d <= 2; matched against stemmed index terms; fuzzy scans the term dictionary).
+- Transactions: `with` needs reads through an uncommitted write txn, which no backend's `ReadTxn` supports; needs
+  a design (overlay or per-backend read-through) before it can be specced.
 
 These are independent of 1.1 and 1.2 and can be taken in any order after them.
 
